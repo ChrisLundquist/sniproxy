@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -166,6 +167,50 @@ static void test_buffer_coalesce(void) {
 
     len = buffer_coalesce(buffer, NULL);
     assert(len == 0);
+
+    free_buffer(buffer);
+}
+
+static void test_buffer_coalesce_wrapped(void) {
+    struct Buffer *buffer;
+    char junk[16];
+    const void *data;
+    size_t len;
+
+    buffer = new_buffer(16, EV_DEFAULT);
+    assert(buffer != NULL);
+
+    /* Contiguous contents not starting at offset 0 */
+    len = buffer_push(buffer, "0123456789AB", 12);
+    assert(len == 12);
+    len = buffer_pop(buffer, junk, 10);
+    assert(len == 10);
+    assert(buffer->head == 10);
+
+    len = buffer_coalesce(buffer, &data);
+    assert(len == 2);
+    assert(memcmp(data, "AB", 2) == 0);
+    /* Contiguous data should be returned in place */
+    assert(buffer->head == 10);
+
+    /* Wrap the contents around the end of the ring buffer */
+    len = buffer_push(buffer, "cdefghij", 8);
+    assert(len == 8);
+    assert(buffer->head + buffer_len(buffer) > buffer_size(buffer));
+
+    len = buffer_coalesce(buffer, &data);
+    assert(len == 10);
+    assert(buffer->head == 0);
+    assert(memcmp(data, "ABcdefghij", 10) == 0);
+
+    /* Exactly full, starting at offset 0 */
+    len = buffer_push(buffer, "klmnop", 6);
+    assert(len == 6);
+    len = buffer_coalesce(buffer, &data);
+    assert(len == 16);
+    assert(memcmp(data, "ABcdefghijklmnop", 16) == 0);
+
+    free_buffer(buffer);
 }
 
 int main(void) {
@@ -178,4 +223,6 @@ int main(void) {
     test4();
 
     test_buffer_coalesce();
+
+    test_buffer_coalesce_wrapped();
 }

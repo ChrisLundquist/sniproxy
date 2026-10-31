@@ -189,10 +189,8 @@ buffer_write(struct Buffer *buffer, int fd) {
  */
 size_t
 buffer_coalesce(struct Buffer *buffer, const void **dst) {
-    size_t buffer_tail = (buffer->head + buffer->len) & buffer->size_mask;
-
-    if (buffer_tail <= buffer->head) {
-        /* buffer not wrapped */
+    if (buffer->head + buffer->len <= buffer_size(buffer)) {
+        /* buffer not wrapped: contents are already contiguous */
         if (dst != NULL)
             *dst = &buffer->buffer[buffer->head];
 
