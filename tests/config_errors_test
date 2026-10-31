@@ -23,6 +23,11 @@ my @cases = (
         config => "listener 127.0.0.1:8443 8444 {\n    protocol tls\n}\n",
         valid => 0,
     },
+    {
+        name => 'unknown bad_requests action',
+        config => "listener 127.0.0.1:8443 {\n    bad_requests drop\n}\n",
+        valid => 0,
+    },
 );
 
 my $failures = 0;
