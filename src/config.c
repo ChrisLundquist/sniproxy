@@ -242,9 +242,15 @@ init_config(const char *filename, struct ev_loop *loop) {
         char line[256];
 
         err("error parsing %s at %jd near:", filename, whence);
-        fseek(file, -20, SEEK_CUR);
-        for (int i = 0; i < 5; i++)
-            err(" %jd\t%s", ftell(file), fgets(line, sizeof(line), file));
+        if (fseek(file, whence > 20 ? -20 : -whence, SEEK_CUR) == 0) {
+            for (int i = 0; i < 5; i++) {
+                intmax_t line_start = ftell(file);
+                if (fgets(line, sizeof(line), file) == NULL)
+                    break;
+                line[strcspn(line, "\r\n")] = '\0';
+                err(" %jd\t%s", line_start, line);
+            }
+        }
 
         free_config(config, loop);
         config = NULL;
