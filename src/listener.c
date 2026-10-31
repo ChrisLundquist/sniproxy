@@ -381,7 +381,7 @@ accept_listener_fallback_address(struct Listener *listener, const char *fallback
             return 1;
         } else if (address_is_hostname(fallback_address)) {
 #ifndef HAVE_LIBUDNS
-            err("Only fallback socket addresses permitted when compiled without libudns");
+            err("Hostname fallback addresses require DNS support, which this build of sniproxy lacks (configure with --enable-dns and libudns): %s", fallback);
             free(fallback_address);
             return 0;
 #else

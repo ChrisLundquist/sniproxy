@@ -68,7 +68,7 @@ accept_backend_arg(struct Backend *backend, const char *arg) {
         }
 #ifndef HAVE_LIBUDNS
         if (!address_is_sockaddr(backend->address)) {
-            err("Only socket address backends are permitted when compiled without libudns");
+            err("Hostname and wildcard (*) backends require DNS support, which this build of sniproxy lacks (configure with --enable-dns and libudns): %s", arg);
             return -1;
         }
 #endif
