@@ -237,6 +237,11 @@ resolv_cancel(struct ResolvQuery *query_handle) {
         }
     }
 
+    /* Free responses from any queries which completed before the cancel */
+    for (size_t i = 0; i < cb_data->response_count; i++)
+        free(cb_data->responses[i]);
+    free(cb_data->responses);
+
     if (cb_data->client_free_cb != NULL)
         cb_data->client_free_cb(cb_data->client_cb_data);
 
