@@ -20,12 +20,13 @@ AC_CHECK_LIB([pcre2-8], [pcre2_compile_8], [],
 			   [AC_MSG_ERROR([libpcre is required])])])
 
 AC_ARG_ENABLE([dns],
-	      [AS_HELP_STRING([--enable-dns], [Enable DNS resolution])])
+	      [AS_HELP_STRING([--enable-dns], [Enable DNS resolution (requires libudns)])])
 
-AM_CONDITIONAL([DNS_ENABLED], [test "$enable_dns"])
+AS_IF([test "x$enable_dns" = "xyes"],
+      [AC_CHECK_LIB([udns], [dns_init], [],
+                    [AC_MSG_ERROR([--enable-dns requires libudns, please install the libudns development headers])])])
 
-AS_IF([test "$enable_dns"],
-      [AC_CHECK_LIB([udns], [dns_init])])
+AM_CONDITIONAL([DNS_ENABLED], [test "x$enable_dns" = "xyes"])
 
 AC_ARG_ENABLE([rfc3339-timestamps],
   [AS_HELP_STRING([--enable-rfc3339-timestamps], [Enable RFC3339 timestamps])],
