@@ -28,6 +28,13 @@ my @cases = (
         config => "listener 127.0.0.1:8443 {\n    bad_requests drop\n}\n",
         valid => 0,
     },
+    {
+        name => 'proxy_protocol accepted for fallback',
+        config => "listener 127.0.0.1:8443 {\n    fallback 192.0.2.1:443 proxy_protocol\n}\n" .
+                  "table {\n    ^a\$ 192.0.2.1:443\n}\n",
+        valid => 1,
+        output => qr/^\tfallback 192\.0\.2\.1:443 proxy$/m,
+    },
 );
 
 my $failures = 0;

@@ -401,8 +401,10 @@ accept_listener_fallback_address(struct Listener *listener, const char *fallback
             fatal("Unexpected fallback address type");
             return 0;
         }
-    } else if (strcasecmp("proxy", fallback) == 0 &&
+    } else if ((strcasecmp("proxy", fallback) == 0 ||
+                strcasecmp("proxy_protocol", fallback) == 0) &&
             listener->fallback_use_proxy_header == 0) {
+        /* "proxy_protocol" matches the table backend option name */
         listener->fallback_use_proxy_header = 1;
         return 1;
     } else {
