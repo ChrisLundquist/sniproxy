@@ -45,7 +45,7 @@ Usage
 
     Usage: sniproxy [-c <config>] [-f] [-n <max file descriptor limit>] [-V]
         -c  configuration file, defaults to /etc/sniproxy.conf
-        -f  run in foreground, do not drop privileges
+        -f  run in foreground, do not daemonize
         -n  specify file descriptor limit
         -V  print the version of SNIProxy and exit
 
