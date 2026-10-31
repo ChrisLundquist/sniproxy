@@ -292,6 +292,7 @@ accept_listener_arg(struct Listener *listener, const char *arg) {
         }
     } else {
         err("Invalid listener argument %s", arg);
+        return -1;
     }
 
     return 1;
