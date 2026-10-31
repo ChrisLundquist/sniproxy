@@ -61,6 +61,12 @@ my @cases = (
         config => "table {\n    ^a\$ 192.0.2.1:443\n",
         valid => 0,
     },
+    {
+        name => 'final line without newline',
+        config => "table {\n    ^a\$ 192.0.2.1:443\n}\npidfile /tmp/sniproxy.pid",
+        valid => 1,
+        output => qr/^pidfile \/tmp\/sniproxy\.pid$/m,
+    },
 );
 
 my $failures = 0;
