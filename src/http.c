@@ -88,7 +88,7 @@ parse_http_header(const char* data, size_t data_len, char **hostname) {
             (*hostname)[i] = '\0';
             result = i;
             break;
-        } else if (!isdigit((*hostname)[i])) {
+        } else if (!isdigit((unsigned char)(*hostname)[i])) {
             break;
         }
 
@@ -105,7 +105,7 @@ get_header(const char *header, const char *data, size_t data_len, char **value) 
     while ((len = next_header(&data, &data_len)) != 0)
         if (len > header_len && strncasecmp(header, data, header_len) == 0) {
             /* Eat leading whitespace */
-            while (header_len < len && isblank(data[header_len]))
+            while (header_len < len && isblank((unsigned char)data[header_len]))
                 header_len++;
 
             *value = malloc(len - header_len + 1);
