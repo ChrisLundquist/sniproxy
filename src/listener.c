@@ -314,12 +314,21 @@ accept_listener_table_name(struct Listener *listener, const char *table_name) {
 
 int
 accept_listener_protocol(struct Listener *listener, const char *protocol) {
-    if (strncasecmp(protocol, http_protocol->name, strlen(protocol)) == 0)
+    if (*protocol != '\0' &&
+            strncasecmp(protocol, http_protocol->name, strlen(protocol)) == 0) {
         listener->protocol = http_protocol;
-    else
+    } else if (strcasecmp(protocol, tls_protocol->name) == 0 ||
+            strcasecmp(protocol, "ssl") == 0 ||
+            strcasecmp(protocol, "https") == 0) {
         listener->protocol = tls_protocol;
+    } else {
+        err("Unknown protocol %s, expected http or tls", protocol);
+        return -1;
+    }
 
-    if (address_port(listener->address) == 0)
+    /* The listener address is normally given before the block, but may be
+     * missing in an invalid configuration (rejected by valid_listener()) */
+    if (listener->address != NULL && address_port(listener->address) == 0)
         address_set_port(listener->address, listener->protocol->default_port);
 
     return 1;
