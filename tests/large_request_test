@@ -1,0 +1,171 @@
+#!/usr/bin/env perl
+
+# Requests larger than the initial 4 KiB client buffer must still be parsed
+# and routed: TLS client hellos with large extensions (session tickets,
+# post-quantum key shares, padding) and HTTP requests with large headers
+# before the Host header.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+use File::Temp;
+use IO::Socket::INET;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Build a TLS 1.2 style client hello with a server name and a padding
+# extension of the given size
+sub client_hello($$) {
+    my ($hostname, $padding) = @_;
+
+    my $sni = pack('n C n', length($hostname) + 3, 0, length($hostname)) . $hostname;
+    my $extensions = pack('n n', 0x0015, $padding) . ("\0" x $padding) .
+                     pack('n n', 0x0000, length($sni)) . $sni;
+
+    my $body = pack('n', 0x0303) .              # client version
+               ("\x42" x 32) .                  # random
+               pack('C', 0) .                   # session id
+               pack('n n', 2, 0x1301) .         # cipher suites
+               pack('C C', 1, 0) .              # compression methods
+               pack('n', length($extensions)) . $extensions;
+
+    my $len = length($body);
+    my $handshake = pack('C C n', 1, $len >> 16, $len & 0xffff) . $body;
+
+    return pack('C n n', 0x16, 0x0301, length($handshake)) . $handshake;
+}
+
+# Accept connections, read a complete TLS record and acknowledge its size
+sub tls_backend($) {
+    my $port = shift;
+
+    my $server = IO::Socket::INET->new(Listen => 5,
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       Proto => 'tcp',
+                                       ReuseAddr => 1)
+        or die "listen: $!";
+
+    while (my $client = $server->accept()) {
+        my $data = '';
+        while (length($data) < 5 ||
+               length($data) < 5 + unpack('n', substr($data, 3, 2))) {
+            my $buffer;
+            last unless defined $client->recv($buffer, 65536) && length($buffer);
+            $data .= $buffer;
+        }
+        print $client "received " . length($data) . "\n";
+        $client->close();
+    }
+}
+
+sub request($$) {
+    my ($port, $request) = @_;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp')
+        or die "couldn't connect $!";
+
+    $socket->send($request);
+
+    my $response = '';
+    while (1) {
+        my $buffer;
+        last unless defined $socket->recv($buffer, 4096) && length($buffer);
+        $response .= $buffer;
+    }
+    $socket->close();
+
+    return $response;
+}
+
+sub tls_worker($) {
+    my $port = shift;
+
+    my $hello = client_hello('large.example.com', 6000);
+    my $response = request($port, $hello);
+
+    if ($response ne 'received ' . length($hello) . "\n") {
+        print STDERR "Unexpected TLS response: $response\n";
+        exit 1;
+    }
+    exit 0;
+}
+
+sub http_worker($) {
+    my $port = shift;
+
+    my $response = request($port, "GET / HTTP/1.1\r\n" .
+                                   "X-Large: " . ('x' x 10000) . "\r\n" .
+                                   "Host: localhost\r\n" .
+                                   "\r\n");
+
+    if ($response !~ m/\AHTTP\/1\.1 200 /) {
+        print STDERR "Unexpected HTTP response: " . substr($response, 0, 64) . "\n";
+        exit 1;
+    }
+    exit 0;
+}
+
+sub main {
+    my $tls_proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $http_proxy_port = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $tls_port = $ENV{TEST_HTTPD_PORT} || 8082;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT2} || 8083;
+
+    my ($fh, $config) = File::Temp::tempfile();
+    print $fh <<END;
+listen 127.0.0.1:$tls_proxy_port {
+    proto tls
+    table tls
+}
+
+listen 127.0.0.1:$http_proxy_port {
+    proto http
+    table http
+}
+
+table tls {
+    ^large\\.example\\.com\$ 127.0.0.1:$tls_port
+}
+
+table http {
+    ^localhost\$ 127.0.0.1:$httpd_port
+}
+END
+    close($fh);
+
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    my $tls_pid = start_child('server', \&tls_backend, $tls_port);
+    my $httpd_pid = start_child('server', \&TestHTTPD::httpd, port => $httpd_port);
+
+    wait_for_port(port => $tls_proxy_port);
+    wait_for_port(port => $http_proxy_port);
+    wait_for_port(port => $tls_port);
+    wait_for_port(port => $httpd_port);
+
+    start_child('worker', \&tls_worker, $tls_proxy_port);
+    start_child('worker', \&http_worker, $http_proxy_port);
+    wait_for_type('worker');
+
+    sleep 1;
+
+    kill 15, $proxy_pid;
+    kill 15, $tls_pid;
+    kill 15, $httpd_pid;
+    sleep 1;
+
+    unlink($config);
+
+    reap_children();
+}
+
+main();

@@ -18,6 +18,7 @@ TESTS += functional_test \
          fallback_test \
          fd_limit_test \
          ipv6_v6only_test \
+         large_request_test \
          proxy_header_test \
          reload_test \
          reload_listener_test \

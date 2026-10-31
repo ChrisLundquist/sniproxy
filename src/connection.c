@@ -51,6 +51,15 @@
                                       _errno == EINTR)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+/* Initial size of client and server buffers, must be a power of 2 */
+#define BUFFER_SIZE 4096
+/*
+ * Largest the client buffer may grow to while waiting for a complete request,
+ * a power of 2 large enough for a maximum size TLS record (16 KiB + 5 byte
+ * header) with a PROXY header prepended.
+ */
+#define MAX_REQUEST_BUFFER_SIZE 32768
+
 
 struct resolv_cb_data {
     struct Connection *connection;
@@ -459,6 +468,17 @@ parse_client_request(struct Connection *con) {
             if (buffer_room(con->client.buffer) > 0)
                 return; /* give client a chance to send more data */
 
+            /*
+             * Buffer is full: grow it, up to a limit, to accommodate large
+             * requests. TLS client hellos can be up to a full 16 KiB record
+             * (large session tickets, post-quantum key shares) and HTTP
+             * requests may carry large cookies.
+             */
+            size_t size = buffer_size(con->client.buffer);
+            if (size < MAX_REQUEST_BUFFER_SIZE &&
+                    buffer_resize(con->client.buffer, size * 2) >= 0)
+                return; /* give client a chance to send more data */
+
             warn("Request from %s exceeded %zu byte buffer size",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
                     buffer_size(con->client.buffer));
@@ -857,13 +877,13 @@ new_connection(struct ev_loop *loop) {
     con->query_handle = NULL;
     con->use_proxy_header = 0;
 
-    con->client.buffer = new_buffer(4096, loop);
+    con->client.buffer = new_buffer(BUFFER_SIZE, loop);
     if (con->client.buffer == NULL) {
         free_connection(con);
         return NULL;
     }
 
-    con->server.buffer = new_buffer(4096, loop);
+    con->server.buffer = new_buffer(BUFFER_SIZE, loop);
     if (con->server.buffer == NULL) {
         free_connection(con);
         return NULL;
