@@ -30,17 +30,28 @@
 #include "logger.h"
 
 static const struct Keyword *find_keyword(const struct Keyword *, const char *);
+static int parse_block(void *, FILE *, const struct Keyword *, int);
 
 
 int
 parse_config(void *context, FILE *cfg, const struct Keyword *grammar) {
+    return parse_block(context, cfg, grammar, 0);
+}
+
+/*
+ * Parse statements until the end of the current block, depth is the number
+ * of enclosing blocks (0 for the top level of the file).
+ */
+static int
+parse_block(void *context, FILE *cfg, const struct Keyword *grammar, int depth) {
     char buffer[256];
     const struct Keyword *keyword = NULL;
     void *sub_context = NULL;
     int result;
 
     for (;;) {
-        switch (next_token(cfg, buffer, sizeof(buffer))) {
+        enum Token token = next_token(cfg, buffer, sizeof(buffer));
+        switch (token) {
             case TOKEN_ERROR:
                 err("%s: tokenizer error", __func__);
                 return -1;
@@ -74,8 +85,8 @@ parse_config(void *context, FILE *cfg, const struct Keyword *grammar) {
                 break;
             case TOKEN_OBRACE:
                 if (keyword && sub_context && keyword->block_grammar) {
-                    result = parse_config(sub_context, cfg,
-                                          keyword->block_grammar);
+                    result = parse_block(sub_context, cfg,
+                                         keyword->block_grammar, depth + 1);
                     if (result > 0 && keyword->finalize)
                         result = keyword->finalize(context, sub_context);
 
@@ -101,8 +112,25 @@ parse_config(void *context, FILE *cfg, const struct Keyword *grammar) {
 
                 break;
             case TOKEN_CBRACE:
+                if (depth == 0) {
+                    err("%s: unexpected '}'", __func__);
+                    return -1;
+                }
                 /* fall through */
             case TOKEN_END:
+                if (depth > 0 && token == TOKEN_END) {
+                    err("%s: unexpected end of file, missing '}'", __func__);
+                    return -1;
+                }
+
+                /* A statement may be ended by the end of the block or file
+                 * as well as by a new line, e.g. table { pattern address } */
+                if (keyword && sub_context && keyword->finalize) {
+                    result = keyword->finalize(context, sub_context);
+                    if (result <= 0)
+                        return result;
+                }
+
                 return 1;
         }
     }

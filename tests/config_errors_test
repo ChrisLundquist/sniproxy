@@ -45,6 +45,22 @@ my @cases = (
         config => "table {\n    ^a#comment 192.0.2.1:443\n}\n",
         valid => 0,
     },
+    {
+        name => 'one line table block keeps its entry',
+        config => "table { ^example\\\\.com\$ 192.0.2.1:443 }\n",
+        valid => 1,
+        output => qr/^\t\^example\\\.com\$ 192\.0\.2\.1:443$/m,
+    },
+    {
+        name => 'stray closing brace',
+        config => "table {\n    ^a\$ 192.0.2.1:443\n}\n}\nnot_a_keyword\n",
+        valid => 0,
+    },
+    {
+        name => 'unclosed block',
+        config => "table {\n    ^a\$ 192.0.2.1:443\n",
+        valid => 0,
+    },
 );
 
 my $failures = 0;
