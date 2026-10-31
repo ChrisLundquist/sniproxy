@@ -20,6 +20,7 @@ TESTS += functional_test \
          ipv6_v6only_test \
          large_request_test \
          proxy_header_test \
+         proxy_header_ipv4_mapped_test \
          reload_test \
          reload_listener_test \
          reuseport_test \

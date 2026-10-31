@@ -370,19 +370,55 @@ reactivate_watcher(struct ev_loop *loop, struct ev_io *w,
     }
 }
 
+static int
+is_ipv4_mapped(const struct sockaddr_storage *ss) {
+    return ss->ss_family == AF_INET6 &&
+        IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *)ss)->sin6_addr);
+}
+
+/*
+ * Convert an IPv4-mapped IPv6 address (::ffff:192.0.2.1), as reported for
+ * IPv4 clients of a dual-stack listener, to the equivalent IPv4 address.
+ */
+static void
+unmap_ipv4_address(struct sockaddr_storage *ss) {
+    const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)ss;
+    struct sockaddr_in in;
+
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_port = in6->sin6_port;
+    memcpy(&in.sin_addr, &in6->sin6_addr.s6_addr[12], sizeof(in.sin_addr));
+
+    memset(ss, 0, sizeof(*ss));
+    memcpy(ss, &in, sizeof(in));
+}
+
 static void
 insert_proxy_v1_header(struct Connection *con) {
     char buf[INET6_ADDRSTRLEN] = { '\0' };
     size_t buf_len;
+    struct sockaddr_storage client_addr = con->client.addr;
+    struct sockaddr_storage local_addr = con->client.local_addr;
+
+    /*
+     * An IPv4 client of a dual-stack listener is reported with IPv4-mapped
+     * addresses; describe it as TCP4 as the PROXY protocol expects, many
+     * receivers do not accept mapped addresses in a TCP6 header.
+     */
+    if (is_ipv4_mapped(&client_addr) && is_ipv4_mapped(&local_addr)) {
+        unmap_ipv4_address(&client_addr);
+        unmap_ipv4_address(&local_addr);
+    }
 
     con->header_len += buffer_push(con->client.buffer, "PROXY ", 6);
 
-    switch (con->client.addr.ss_family) {
+    switch (client_addr.ss_family) {
         case AF_INET:
             con->header_len += buffer_push(con->client.buffer, "TCP4 ", 5);
 
             inet_ntop(AF_INET,
-                      &((const struct sockaddr_in *)&con->client.addr)->
+                      &((const struct sockaddr_in *)&client_addr)->
                       sin_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
@@ -390,26 +426,26 @@ insert_proxy_v1_header(struct Connection *con) {
             con->header_len += buffer_push(con->client.buffer, " ", 1);
 
             inet_ntop(AF_INET,
-                      &((const struct sockaddr_in *)&con->client.local_addr)->
+                      &((const struct sockaddr_in *)&local_addr)->
                       sin_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in *)&con->
-                              client.addr)->sin_port));
+                              ntohs(((const struct sockaddr_in *)&
+                              client_addr)->sin_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in *)&con->
-                              client.local_addr)->sin_port));
+                              ntohs(((const struct sockaddr_in *)&
+                              local_addr)->sin_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             break;
         case AF_INET6:
             con->header_len += buffer_push(con->client.buffer, "TCP6 ", 5);
             inet_ntop(AF_INET6,
-                    &((const struct sockaddr_in6 *)&con->client.addr)->
+                    &((const struct sockaddr_in6 *)&client_addr)->
                     sin6_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
@@ -417,19 +453,19 @@ insert_proxy_v1_header(struct Connection *con) {
             con->header_len += buffer_push(con->client.buffer, " ", 1);
 
             inet_ntop(AF_INET6,
-                      &((const struct sockaddr_in6 *)&con->
-                      client.local_addr)->sin6_addr, buf, sizeof(buf));
+                      &((const struct sockaddr_in6 *)&
+                      local_addr)->sin6_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in6 *)&con->
-                              client.addr)->sin6_port));
+                              ntohs(((const struct sockaddr_in6 *)&
+                              client_addr)->sin6_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in6 *)&con->
-                              client.local_addr)->sin6_port));
+                              ntohs(((const struct sockaddr_in6 *)&
+                              local_addr)->sin6_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             break;
