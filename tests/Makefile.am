@@ -26,7 +26,8 @@ TESTS += functional_test \
 if DNS_ENABLED
   TESTS += config_test \
            resolv_test \
-           bad_dns_request_test
+           bad_dns_request_test \
+           reload_dns_test
 endif
 
 check_PROGRAMS = http_test \

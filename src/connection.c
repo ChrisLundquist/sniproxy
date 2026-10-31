@@ -510,6 +510,22 @@ resolve_server_address(struct Connection *con, struct ev_loop *loop) {
 
         return;
 #else
+        /*
+         * The DNS query outlives this call, but unless the lookup handed us
+         * our own copy, result.address points into the running configuration
+         * (a table backend or the listener's fallback) which a reload can
+         * free before the query completes. Take a private copy.
+         */
+        if (!result.caller_free_address) {
+            result.address = copy_address(result.address);
+            if (result.address == NULL) {
+                err("%s: copy_address", __func__);
+                abort_connection(con);
+                return;
+            }
+            result.caller_free_address = 1;
+        }
+
         struct resolv_cb_data *cb_data = malloc(sizeof(struct resolv_cb_data));
         if (cb_data == NULL) {
             err("%s: malloc", __func__);
