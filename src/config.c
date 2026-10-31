@@ -408,7 +408,15 @@ end_table_stanza(struct Config *config, struct Table *table) {
 
 static int
 end_backend(struct Table *table, struct Backend *backend) {
-    /* TODO check backend */
+    if (backend->address == NULL) {
+        err("No address specified for table entry %s", backend->pattern);
+        return -1;
+    }
+
+    /* Compile the pattern now so an invalid regular expression rejects the
+     * configuration, rather than failing at the first lookup */
+    if (!init_backend(backend))
+        return -1;
 
     table->use_proxy_header = table->use_proxy_header ||
                               backend->use_proxy_header;

@@ -35,6 +35,16 @@ my @cases = (
         valid => 1,
         output => qr/^\tfallback 192\.0\.2\.1:443 proxy$/m,
     },
+    {
+        name => 'invalid regular expression',
+        config => "table {\n    ^(unclosed 192.0.2.1:443\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'table entry without address',
+        config => "table {\n    ^a#comment 192.0.2.1:443\n}\n",
+        valid => 0,
+    },
 );
 
 my $failures = 0;
