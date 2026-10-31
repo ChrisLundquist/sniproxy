@@ -46,7 +46,12 @@ struct Address {
 
     size_t len;     /* length of data */
     uint16_t port;  /* for hostname and wildcard */
-    char data[];
+    /*
+     * data holds either a NUL-terminated hostname or a struct sockaddr which
+     * is accessed in place, so it must be suitably aligned for any sockaddr
+     * type.
+     */
+    _Alignas(struct sockaddr_storage) char data[];
 };
 
 
