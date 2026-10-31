@@ -132,7 +132,7 @@ struct LookupResult
 table_lookup_server_address(const struct Table *table, const char *name, size_t name_len) {
     struct Backend *b = table_lookup_backend(table, name, name_len);
     if (b == NULL) {
-        info("No match found for %.*s", (int)name_len, name);
+        info("No match found for %.*s", (int)name_len, name ? name : "");
         return (struct LookupResult){.address = NULL};
     }
 

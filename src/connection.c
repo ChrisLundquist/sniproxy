@@ -470,6 +470,12 @@ parse_client_request(struct Connection *con) {
             abort_connection(con);
             return;
         }
+
+        /* Continue to the fallback without a hostname; result is an error
+         * code, not a length */
+        free(hostname);
+        hostname = NULL;
+        result = 0;
     }
 
     con->hostname = hostname;
@@ -866,7 +872,11 @@ log_connection(struct Connection *con) {
     char client_address[ADDRESS_BUFFER_SIZE];
     char listener_address[ADDRESS_BUFFER_SIZE];
     char server_address[ADDRESS_BUFFER_SIZE];
-
+    /* Requests without a hostname (sent to the fallback) used to pass NULL
+     * to %s, keep glibc's rendering of that for log parsers */
+    const char *hostname = con->hostname != NULL ? con->hostname : "(null)";
+    int hostname_len = con->hostname != NULL ?
+        (int)con->hostname_len : (int)strlen(hostname);
 
     display_sockaddr(&con->client.addr, client_address, sizeof(client_address));
     display_sockaddr(&con->client.local_addr, listener_address, sizeof(listener_address));
@@ -878,8 +888,8 @@ log_connection(struct Connection *con) {
            client_address,
            listener_address,
            server_address,
-           (int)con->hostname_len,
-           con->hostname,
+           hostname_len,
+           hostname,
            con->server.buffer->tx_bytes,
            con->server.buffer->rx_bytes,
            con->client.buffer->tx_bytes,
