@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h> /* tolower */
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -63,6 +64,7 @@ static const char valid_label_bytes[] =
 
 
 static int valid_hostname(const char *);
+static int parse_port(const char *);
 
 
 struct Address *
@@ -114,7 +116,7 @@ new_address(const char *hostname_or_ip) {
     if ((port = strrchr(hostname_or_ip, ':')) != NULL &&
             is_numeric(port + 1)) {
         len = (size_t)(port - hostname_or_ip);
-        int port_num = atoi(port + 1);
+        int port_num = parse_port(port + 1);
 
         if (len < sizeof(ip_buf) && port_num >= 0 && port_num <= 65535) {
             strncpy(ip_buf, hostname_or_ip, len);
@@ -367,8 +369,8 @@ address_set_port(struct Address *addr, uint16_t port) {
 
 int
 address_set_port_str(struct Address *addr, const char* str) {
-    int port = atoi(str);
-    if (port < 0 || port > 65535) {
+    int port = parse_port(str);
+    if (port < 0) {
         return 0;
     }
     address_set_port(addr, (uint16_t)port);
@@ -450,17 +452,40 @@ display_sockaddr(const void *sa, char *buffer, size_t buffer_len) {
     return buffer;
 }
 
+/*
+ * Returns true iff s is a non-empty string consisting only of decimal digits.
+ *
+ * This is used to recognize port numbers, so floating point, hexadecimal,
+ * signed, or whitespace-padded forms which strtod() would accept ("1e3",
+ * "0x50", "nan", " 80") are deliberately rejected.
+ */
 int
 is_numeric(const char *s) {
-    char *p;
-
     if (s == NULL || *s == '\0')
         return 0;
 
-    int n = strtod(s, &p);
-    (void)n; /* unused */
+    for (; *s != '\0'; s++)
+        if (*s < '0' || *s > '9')
+            return 0;
 
-    return *p == '\0'; /* entire string was numeric */
+    return 1;
+}
+
+/*
+ * Parse a decimal port number, returns the port or -1 if invalid.
+ */
+static int
+parse_port(const char *s) {
+    if (!is_numeric(s))
+        return -1;
+
+    errno = 0;
+    char *end;
+    long port = strtol(s, &end, 10);
+    if (errno != 0 || *end != '\0' || port < 0 || port > 65535)
+        return -1;
+
+    return (int)port;
 }
 
 static int
