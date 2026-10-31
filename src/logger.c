@@ -120,12 +120,24 @@ reopen_loggers(void) {
             closelog();
             openlog(PACKAGE_NAME, LOG_PID, 0);
         } else if (sink->type == LOG_SINK_FILE) {
-            sink->fd = freopen(sink->filepath, "a", sink->fd);
-            if (sink->fd == NULL)
+            /*
+             * Open the new file before closing the old one: freopen() closes
+             * the original stream even when it fails, which would leave a
+             * NULL stream behind (and crash the next reopen or fclose()).
+             * If the file can't be reopened, e.g. it was created by root
+             * before privileges were dropped, keep logging to the old one.
+             */
+            FILE *fd = fopen(sink->filepath, "a");
+            if (fd == NULL) {
                 err("failed to reopen log file %s: %s",
                         sink->filepath, strerror(errno));
-            else
-                setvbuf(sink->fd, NULL, _IOLBF, 0);
+                continue;
+            }
+
+            setvbuf(fd, NULL, _IOLBF, 0);
+            if (sink->fd != NULL)
+                fclose(sink->fd);
+            sink->fd = fd;
         }
     }
 }
