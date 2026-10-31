@@ -129,7 +129,9 @@ resolv_init(struct ev_loop *loop, char **nameservers, char **search, int mode) {
                 dns_add_srch(ctx, search[i]);
     }
 
-    default_resolv_mode = mode;
+    /* Keep the documented IPv4 only default unless a mode was configured */
+    if (mode != RESOLV_MODE_DEFAULT)
+        default_resolv_mode = mode;
 
     int sockfd = dns_open(ctx);
     if (sockfd < 0)
