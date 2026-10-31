@@ -554,12 +554,14 @@ resolve_server_address(struct Connection *con, struct ev_loop *loop) {
         if (con->query_handle == NULL) {
             /*
              * resolv_query() failed to submit the query (and has already
-             * run free_resolv_cb_data on cb_data). Do not enter RESOLVING
-             * with a NULL query_handle: close_client_socket() would then
-             * call resolv_cancel(NULL) and dereference it.
+             * run free_resolv_cb_data on cb_data, freeing result.address).
+             * Do not enter RESOLVING with a NULL query_handle:
+             * close_client_socket() would then call resolv_cancel(NULL) and
+             * dereference it.
              */
-            notice("unable to submit DNS query for %s, closing connection",
-                    address_hostname(result.address));
+            notice("unable to submit DNS query for request %.*s, closing connection",
+                    con->hostname != NULL ? (int)con->hostname_len : 0,
+                    con->hostname != NULL ? con->hostname : "");
             abort_connection(con);
             return;
         }
