@@ -444,6 +444,14 @@ parse_client_request(struct Connection *con) {
     payload_len -= con->header_len;
 
     int result = con->listener->protocol->parse_packet(payload, payload_len, &hostname);
+    if (result > 0 && memchr(hostname, '\0', (size_t)result) != NULL) {
+        /* A hostname can't contain a NUL byte, and the rest of sniproxy
+         * would see the hostname truncated at it, treat as malformed */
+        free(hostname);
+        hostname = NULL;
+        result = -5;
+    }
+
     if (result < 0) {
         char client[INET6_ADDRSTRLEN + 8];
 
