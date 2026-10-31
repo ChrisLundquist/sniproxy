@@ -123,10 +123,14 @@ resolv_init(struct ev_loop *loop, char **nameservers, char **search, int mode) {
 
         for (int i = 0; nameservers[i] != NULL; i++)
             dns_add_serv(ctx, nameservers[i]);
+    }
 
-        if (search != NULL)
-            for (int i = 0; search[i] != NULL; i++)
-                dns_add_srch(ctx, search[i]);
+    /* Configured search domains replace the system's, whether or not
+     * nameservers were configured */
+    if (search != NULL) {
+        dns_add_srch(ctx, NULL);
+        for (int i = 0; search[i] != NULL; i++)
+            dns_add_srch(ctx, search[i]);
     }
 
     /* Keep the documented IPv4 only default unless a mode was configured */
