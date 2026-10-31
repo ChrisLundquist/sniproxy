@@ -53,6 +53,7 @@ static void accept_cb(struct ev_loop *, struct ev_io *, int);
 static void backoff_timer_cb(struct ev_loop *, struct ev_timer *, int);
 static int init_listener(struct Listener *, const struct Table_head *, struct ev_loop *);
 static void listener_update(struct Listener *, struct Listener *,  const struct Table_head *);
+static void inherit_fallback_port(struct Listener *);
 static void free_listener(struct Listener *);
 static int parse_boolean(const char *);
 
@@ -171,10 +172,24 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
     free(existing_listener->fallback_address);
     existing_listener->fallback_address = new_listener->fallback_address;
     new_listener->fallback_address = NULL;
+    existing_listener->fallback_use_proxy_header =
+        new_listener->fallback_use_proxy_header;
+    /* new_listener was never initialized, so apply the same defaults
+     * init_listener() would have */
+    inherit_fallback_port(existing_listener);
 
     free(existing_listener->source_address);
     existing_listener->source_address = new_listener->source_address;
     new_listener->source_address = NULL;
+    existing_listener->transparent_proxy = new_listener->transparent_proxy;
+
+    if (existing_listener->reuseport != new_listener->reuseport ||
+            existing_listener->ipv6_v6only != new_listener->ipv6_v6only) {
+        char address[ADDRESS_BUFFER_SIZE];
+        warn("Listener %s: changes to reuseport or ipv6_v6only require a restart",
+                display_address(existing_listener->address,
+                    address, sizeof(address)));
+    }
 
     existing_listener->protocol = new_listener->protocol;
 
@@ -198,7 +213,25 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
 
         table_ref_put(new_listener->table);
         new_listener->table = NULL;
+    } else {
+        char address[ADDRESS_BUFFER_SIZE];
+        err("Table \"%s\" not defined, listener %s continues using its previous table",
+                existing_listener->table_name,
+                display_address(existing_listener->address,
+                    address, sizeof(address)));
     }
+}
+
+/*
+ * If no port was specified on the fallback address, inherit the port from the
+ * listening address
+ */
+static void
+inherit_fallback_port(struct Listener *listener) {
+    if (listener->fallback_address &&
+            address_port(listener->fallback_address) == 0)
+        address_set_port(listener->fallback_address,
+                address_port(listener->address));
 }
 
 struct Listener *
@@ -501,12 +534,7 @@ init_listener(struct Listener *listener, const struct Table_head *tables,
     init_table(table);
     listener->table = table_ref_get(table);
 
-    /* If no port was specified on the fallback address, inherit the address
-     * from the listening address */
-    if (listener->fallback_address &&
-            address_port(listener->fallback_address) == 0)
-        address_set_port(listener->fallback_address,
-                address_port(listener->address));
+    inherit_fallback_port(listener);
 
 #ifdef HAVE_ACCEPT4
     int sockfd = socket(address_sa(listener->address)->sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);

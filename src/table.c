@@ -176,6 +176,10 @@ reload_tables(struct Table_head *tables, struct Table_head *new_tables) {
             struct Backend_head temp = existing->backends;
             existing->backends = iter->backends;
             iter->backends = temp;
+            /* use_proxy_header summarizes the backends, so it moves with
+             * them: accept_connection() relies on it to decide whether to
+             * prepend the PROXY header */
+            existing->use_proxy_header = iter->use_proxy_header;
         } else {
             add_table(tables, iter);
         }
