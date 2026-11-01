@@ -417,9 +417,18 @@ obtain_file_sink(const char *filepath) {
     if (sink == NULL)
         return NULL;
 
+    /* The path identifies the sink in the shared list and is needed to
+     * reopen it, so a sink without one must never be added */
+    sink->filepath = strdup(filepath);
+    if (sink->filepath == NULL) {
+        free(sink);
+        err("%s: strdup", __func__);
+        return NULL;
+    }
 
     FILE *fd = fopen(filepath, "a");
     if (fd == NULL) {
+        free((char *)sink->filepath);
         free(sink);
         err("Failed to open new log file: %s", filepath);
         return NULL;
@@ -427,7 +436,6 @@ obtain_file_sink(const char *filepath) {
     setvbuf(fd, NULL, _IOLBF, 0);
 
     sink->type = LOG_SINK_FILE;
-    sink->filepath = strdup(filepath);
     sink->fd = fd;
     sink->reference_count = 0;
 
@@ -471,7 +479,8 @@ free_sink(struct LogSink *sink) {
             sink->fd = NULL;
             break;
         case LOG_SINK_FILE:
-            fclose(sink->fd);
+            if (sink->fd != NULL)
+                fclose(sink->fd);
             sink->fd = NULL;
             free((char *)sink->filepath);
             sink->filepath = NULL;
