@@ -32,6 +32,17 @@ static const char *good[] = {
         "\r\n",
 };
 static const char *bad[] = {
+    /* Host header without a value, or with only a port */
+    "GET / HTTP/1.1\r\n"
+        "Host:\r\n"
+        "Host: localhost\r\n"
+        "\r\n",
+    "GET / HTTP/1.1\r\n"
+        "Host: :80\r\n"
+        "\r\n",
+    "GET / HTTP/1.1\r\n"
+        "Host: :\r\n"
+        "\r\n",
     /* empty Host header */
     "GET / HTTP/1.1\r\n"
         "Host: \r\n"

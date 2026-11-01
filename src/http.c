@@ -92,6 +92,13 @@ parse_http_header(const char* data, size_t data_len, char **hostname) {
             break;
         }
 
+    /* Only a port, e.g. "Host: :80", doesn't name a host either */
+    if (result == 0) {
+        free(*hostname);
+        *hostname = NULL;
+        return -2;
+    }
+
     return result;
 }
 
@@ -103,7 +110,9 @@ get_header(const char *header, const char *data, size_t data_len, char **value) 
 
     /* loop through headers stopping at first blank line */
     while ((len = next_header(&data, &data_len)) != 0)
-        if (len > header_len && strncasecmp(header, data, header_len) == 0) {
+        /* >= so a header with nothing after the colon is found too, and
+         * rejected as empty below rather than skipped for a later one */
+        if (len >= header_len && strncasecmp(header, data, header_len) == 0) {
             /* Eat leading whitespace */
             while (header_len < len && isblank((unsigned char)data[header_len]))
                 header_len++;
