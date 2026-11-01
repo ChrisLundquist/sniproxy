@@ -1,0 +1,176 @@
+#!/usr/bin/env perl
+
+# Reopening log files on SIGHUP: when a log file can't be reopened (e.g. it
+# was rotated and the unprivileged sniproxy may not create the new one)
+# sniproxy has to keep logging to the file it has open, and must not crash on
+# a later reload or at shutdown. Once the log file can be opened again, the
+# next reload switches to it.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+sub worker($$$$) {
+    my ($hostname, $path, $port, $requests) = @_;
+
+    for (my $i = 0; $i < $requests; $i++) {
+        system('curl',
+                '-s', '-S',
+                '-H', "Host: $hostname",
+                '-o', '/dev/null',
+                "http://localhost:$port/$path");
+
+        if ($? == -1) {
+            die "failed to execute: $!\n";
+        } elsif ($? & 127) {
+            printf STDERR "child died with signal %d, %s coredump\n", ($? & 127), ($? & 128) ? 'with' : 'without';
+            exit 255;
+        } elsif ($? >> 8) {
+            exit $? >> 8;
+        }
+    }
+    # Success
+    exit 0;
+}
+
+sub write_config($$$$) {
+    my ($filename, $proxy_port, $httpd_port, $logfile) = @_;
+
+    open(my $fh, '>', $filename)
+        or die("open(): $!");
+
+    print $fh <<END;
+listen 127.0.0.1 $proxy_port {
+    proto http
+    table test
+    access_log $logfile
+}
+
+table test {
+    localhost 127.0.0.1 $httpd_port
+}
+END
+
+    close($fh);
+    chmod(0644, $filename);
+}
+
+sub fail($) {
+    my $message = shift;
+
+    print "$message\n";
+    reap_children();
+    exit 1;
+}
+
+sub count_lines($) {
+    my $filename = shift;
+
+    open(my $fh, '<', $filename)
+        or return 0;
+    my @lines = <$fh>;
+    close($fh);
+
+    return scalar @lines;
+}
+
+# Wait until the access log has at least $expected lines and no more are being
+# written (it is written as each connection closes), return the line count
+sub expect_lines($$$) {
+    my ($filename, $expected, $when) = @_;
+
+    my $count = 0;
+    for (my $i = 0; $i < 50; $i++) {
+        my $previous = $count;
+        $count = count_lines($filename);
+        return $count if $count >= $expected && $count == $previous;
+
+        select(undef, undef, undef, 0.2);
+    }
+
+    fail("$when: expected at least $expected lines in $filename, found $count");
+}
+
+sub requests($$) {
+    my ($port, $requests) = @_;
+
+    start_child('worker', \&worker, 'localhost', '', $port, $requests);
+    wait_for_type('worker');
+}
+
+sub reload($) {
+    my $proxy_pid = shift;
+
+    kill 'HUP', $proxy_pid;
+    sleep 1;
+
+    fail("sniproxy exited after SIGHUP") unless kill(0, $proxy_pid);
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8081;
+    my $requests = $ENV{ITERATIONS} || 10;
+
+    my $dir = world_readable_tempdir();
+    my $config = "$dir/sniproxy.conf";
+    my $logfile = "$dir/access.log";
+    my $rotated = "$dir/access.log.1";
+
+    write_config($config, $proxy_port, $httpd_port, $logfile);
+
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    my $httpd_pid = start_child('server', \&TestHTTPD::httpd, port => $httpd_port);
+
+    wait_for_port(port => $httpd_port);
+    wait_for_port(port => $proxy_port);
+
+    requests($proxy_port, $requests);
+    my $lines = expect_lines($logfile, $requests, 'before rotation');
+
+    # Rotate the log, leaving a directory where the new log file belongs so
+    # that reopening it fails whatever the privileges of sniproxy
+    rename($logfile, $rotated) or die("rename(): $!");
+    mkdir($logfile) or die("mkdir(): $!");
+
+    # Twice: the second reload reopens the log again, and logging must
+    # continue to the rotated file both times
+    for my $when ('after first failed reopen', 'after second failed reopen') {
+        reload($proxy_pid);
+        requests($proxy_port, $requests);
+        $lines = expect_lines($rotated, $lines + $requests, $when);
+    }
+
+    # Recreate the log file like logrotate's create directive, the next reload
+    # switches to it
+    rmdir($logfile) or die("rmdir(): $!");
+    open(my $fh, '>', $logfile) or die("open(): $!");
+    close($fh);
+    chmod(0666, $logfile);
+
+    reload($proxy_pid);
+    requests($proxy_port, $requests);
+    expect_lines($logfile, $requests, 'after successful reopen');
+    my $rotated_lines = count_lines($rotated);
+    fail("$rotated still written after reopen: $rotated_lines lines, expected $lines")
+        unless $rotated_lines == $lines;
+
+    # Orderly shutdown of the server, closing the reopened log file
+    kill 15, $proxy_pid;
+    kill 15, $httpd_pid;
+    sleep 1;
+
+    # Kill off any remaining children
+    reap_children();
+}
+
+main();

@@ -25,6 +25,7 @@ TESTS += functional_test \
          proxy_header_ipv4_mapped_test \
          reload_test \
          reload_listener_test \
+         reload_log_test \
          request_timeout_test \
          reuseport_test \
          slow_client_test \
