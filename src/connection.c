@@ -61,8 +61,8 @@
 #define MAX_REQUEST_BUFFER_SIZE 32768
 /*
  * Seconds between sweeps for connections exceeding their listener's request
- * timeout. Timeouts are configured in whole seconds, so a connection is
- * closed at most this long after its deadline.
+ * or idle timeout. Timeouts are configured in whole seconds, so a connection
+ * is closed at most this long after its deadline.
  */
 #define TIMEOUT_SWEEP_INTERVAL 1.0
 
@@ -101,6 +101,7 @@ static void close_server_socket(struct Connection *, struct ev_loop *);
 static void timeout_cb(struct ev_loop *, struct ev_timer *, int);
 static void check_connection_timeout(struct Connection *, ev_tstamp,
         struct ev_loop *);
+static ev_tstamp connection_last_activity(const struct Connection *);
 static void retire_connection(struct Connection *);
 static struct Connection *new_connection(struct ev_loop *);
 static void log_connection(struct Connection *);
@@ -347,7 +348,7 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
 
 /*
  * Periodic sweep closing connections which have exceeded their listener's
- * request timeout
+ * request or idle timeout
  *
  * One timer serves every connection rather than each having its own. The
  * whole queue is examined on each sweep, least recently active first. The
@@ -377,12 +378,15 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
 }
 
 /*
- * Close and free con if it has exceeded its listener's request timeout
+ * Close and free con if it has exceeded either of its listener's timeouts
  *
  * The request timeout limits how long after accepting the connection we may
  * still be waiting for the client's complete request or resolving the
  * server's address. It runs from accept time, so it also bounds clients
  * which trickle their request a byte at a time (slowloris).
+ *
+ * The idle timeout limits how long no data may be received or sent on
+ * either socket, in any state.
  */
 static void
 check_connection_timeout(struct Connection *con, ev_tstamp now,
@@ -390,29 +394,50 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
     const struct Listener *listener = con->listener;
     char client[ADDRESS_BUFFER_SIZE];
 
-    if (listener->request_timeout <= 0 || !server_connect_pending(con) ||
-            now - con->established_timestamp < listener->request_timeout)
+    if (listener->request_timeout > 0 && server_connect_pending(con) &&
+            now - con->established_timestamp >= listener->request_timeout) {
+        display_sockaddr(&con->client.addr, client, sizeof(client));
+
+        if (con->state == RESOLVING)
+            notice("Timed out after %d seconds resolving server address for "
+                    "request %.*s from %s, closing connection",
+                    listener->request_timeout,
+                    con->hostname != NULL ? (int)con->hostname_len : 0,
+                    con->hostname != NULL ? con->hostname : "",
+                    client);
+        else
+            notice("Request from %s not received within %d seconds, "
+                    "closing connection",
+                    client, listener->request_timeout);
+    } else if (listener->idle_timeout > 0 &&
+            now - connection_last_activity(con) >= listener->idle_timeout) {
+        info("Connection from %s idle for %d seconds, closing connection",
+                display_sockaddr(&con->client.addr, client, sizeof(client)),
+                listener->idle_timeout);
+    } else {
         return;
-
-    display_sockaddr(&con->client.addr, client, sizeof(client));
-
-    if (con->state == RESOLVING)
-        notice("Timed out after %d seconds resolving server address for "
-                "request %.*s from %s, closing connection",
-                listener->request_timeout,
-                con->hostname != NULL ? (int)con->hostname_len : 0,
-                con->hostname != NULL ? con->hostname : "",
-                client);
-    else
-        notice("Request from %s not received within %d seconds, "
-                "closing connection",
-                client, listener->request_timeout);
+    }
 
     /* Discard anything still buffered: an expired connection gets no
      * further chances to make progress. Closing the client socket cancels
      * any DNS query in progress, so resolv_cb() will not be called. */
     close_connection(con, loop);
     retire_connection(con);
+}
+
+/*
+ * Time of the most recent receive or send on either socket
+ */
+static ev_tstamp
+connection_last_activity(const struct Connection *con) {
+    ev_tstamp last = con->established_timestamp;
+
+    last = MAX(last, con->client.buffer->last_recv);
+    last = MAX(last, con->client.buffer->last_send);
+    last = MAX(last, con->server.buffer->last_recv);
+    last = MAX(last, con->server.buffer->last_send);
+
+    return last;
 }
 
 /*

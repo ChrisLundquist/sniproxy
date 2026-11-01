@@ -144,8 +144,10 @@ Configuration Syntax
         fallback 192.0.2.5:443
 
         # Close connections which have not sent a complete request within 10
-        # seconds (default 30)
+        # seconds (default 30), and connections idle for 5 minutes (default:
+        # never)
         request_timeout 10
+        idle_timeout 300
     }
 
     table TableName {
