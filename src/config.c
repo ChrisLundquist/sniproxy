@@ -28,6 +28,15 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#ifdef HAVE_LIBUDNS
+#include <udns.h>
+#define MAX_NAMESERVERS DNS_MAXSERV
+#else
+#define MAX_NAMESERVERS 6 /* udns's DNS_MAXSERV */
+#endif
 #include "cfg_parser.h"
 #include "config.h"
 #include "logger.h"
@@ -633,13 +642,24 @@ free_string_vector(char **vector) {
 
 static int
 accept_resolver_nameserver(struct ResolverConfig *resolver, const char *nameserver) {
-    /* Validate address is a valid IP */
-    struct Address *ns_address = new_address(nameserver);
-    if (!address_is_sockaddr(ns_address)) {
-        free(ns_address);
+    /*
+     * Name servers are handed to udns's dns_add_serv(), which only accepts a
+     * numeric IPv4 or IPv6 address and always uses port 53. Reject anything
+     * else (a port, a unix socket, ...) here: udns would ignore it and, if no
+     * usable name server remained, silently query 127.0.0.1 instead.
+     */
+    struct in6_addr addr;
+    if (inet_pton(AF_INET, nameserver, &addr) != 1 &&
+            inet_pton(AF_INET6, nameserver, &addr) != 1) {
+        err("Invalid nameserver %s: expected an IPv4 or IPv6 address without a port",
+                nameserver);
         return -1;
     }
-    free(ns_address);
+
+    if (string_vector_len(resolver->nameservers) >= MAX_NAMESERVERS) {
+        err("Too many nameservers: at most %d are supported", MAX_NAMESERVERS);
+        return -1;
+    }
 
     return append_to_string_vector(&resolver->nameservers, nameserver);
 }

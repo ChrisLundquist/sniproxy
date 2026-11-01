@@ -89,6 +89,11 @@ hostnames as addresses in the configuration or using wildcard backends.  If not
 specified the IPv4 only queries will be preformed using the system default name
 servers.
 
+Each nameserver is a numeric IPv4 or IPv6 address, queried on port 53; a port
+can not be specified. Up to six name servers may be listed, they are tried in
+order. Each search line appends a domain to the search list, which is applied
+as described in resolv.conf(5).
+
 Four modes are supported:
 
 ipv4_only: query for any A records, use the first A record returned
