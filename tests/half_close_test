@@ -193,7 +193,9 @@ sub incomplete_request_worker($$) {
         alarm 10;
 
         my $socket = connect_proxy($port);
-        syswrite($socket, "GET / HTTP/1.1\r\nHost: localh") or die "write: $!\n";
+        # No complete header line yet, so the request is incomplete for any
+        # parser: only the end of stream decides what happens to it
+        syswrite($socket, "GET / HTTP/1.1\r\nUser-Agent: half_close_te") or die "write: $!\n";
         shutdown($socket, 1) or die "shutdown: $!\n";
 
         my $response = read_all($socket);
