@@ -34,6 +34,12 @@
 #ifdef HAVE_LIBUDNS
 #include <udns.h>
 #define MAX_NAMESERVERS DNS_MAXSERV
+/*
+ * udns keeps the search list as consecutive wire format names, terminated by
+ * an empty name, in a 1024 byte buffer: their total length can be at most
+ * 1023 bytes. A wire format name is two bytes longer than its text form.
+ */
+#define MAX_SEARCH_LIST_LEN 1023
 #else
 #define MAX_NAMESERVERS 6 /* udns's DNS_MAXSERV */
 #endif
@@ -686,6 +692,29 @@ accept_resolver_search(struct ResolverConfig *resolver, const char *search) {
         return -1;
     }
     free(search_address);
+
+#ifdef HAVE_LIBUDNS
+    /* Reject a search list which won't fit in udns's buffer here, rather
+     * than have resolv_init() fail at startup */
+    size_t search_list_len = 0;
+    for (size_t i = 0; i < string_vector_len(resolver->search); i++) {
+        dnsc_t dn[DNS_MAXDN];
+        search_list_len += (size_t)dns_sptodn(resolver->search[i], dn, sizeof(dn));
+    }
+
+    dnsc_t dn[DNS_MAXDN];
+    int dn_len = dns_sptodn(search, dn, sizeof(dn));
+    if (dn_len <= 0) {
+        err("Invalid search domain %s", search);
+        return -1;
+    }
+    if (search_list_len + (size_t)dn_len > MAX_SEARCH_LIST_LEN) {
+        err("Search domain %s doesn't fit: the search domains may take up to "
+                "%d bytes in total, each one its length plus 2",
+                search, MAX_SEARCH_LIST_LEN);
+        return -1;
+    }
+#endif
 
     return append_to_string_vector(&resolver->search, search);
 }

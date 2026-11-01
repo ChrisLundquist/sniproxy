@@ -92,7 +92,8 @@ servers.
 Each nameserver is a numeric IPv4 or IPv6 address, queried on port 53; a port
 can not be specified. Up to six name servers may be listed, they are tried in
 order. Each search line appends a domain to the search list, which is applied
-as described in resolv.conf(5).
+as described in resolv.conf(5). The search domains may take up to 1023 bytes in
+total, counting each one as its length plus 2.
 
 Four modes are supported:
 

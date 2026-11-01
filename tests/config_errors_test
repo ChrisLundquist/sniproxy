@@ -103,6 +103,23 @@ my @cases = (
         output => qr/^\tnameserver 192\.0\.2\.6$/m,
     },
     {
+        # 24 domains of 40 characters take 24 * 42 = 1008 of udns's 1023
+        # bytes, a 13 character one takes the remaining 15
+        name => 'search list filling the udns buffer accepted',
+        config => "resolver {\n" .
+                  join('', map { sprintf("    search d%02d-%s.example\n", $_, 'x' x 28) } 0..23) .
+                  "    search " . ('a' x 13) . "\n}\n",
+        valid => 1,
+        output => qr/^\tsearch a{13}$/m,
+    },
+    {
+        name => 'search list overflowing the udns buffer',
+        config => "resolver {\n" .
+                  join('', map { sprintf("    search d%02d-%s.example\n", $_, 'x' x 28) } 0..23) .
+                  "    search " . ('a' x 14) . "\n}\n",
+        valid => 0,
+    },
+    {
         # udns supports at most six, more used to be dropped silently
         name => 'seven nameservers',
         config => "resolver {\n" . join('', map { "    nameserver 192.0.2.$_\n" } 1..7) . "}\n",
