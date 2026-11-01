@@ -1,0 +1,235 @@
+#!/usr/bin/env perl
+
+# Verify the listener idle_timeout:
+#  - an established connection with no traffic in either direction for the
+#    idle timeout is closed
+#  - a connection with regular traffic is kept open past the idle timeout
+#  - without idle_timeout (the default) an established connection is kept
+#    open, the request timeout no longer applying once connected
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use File::Temp;
+use IO::Select;
+use IO::Socket::INET;
+use Time::HiRes qw(time sleep);
+
+# Seconds. Connections are checked once a second, so an idle connection is
+# closed between IDLE_TIMEOUT and IDLE_TIMEOUT + 1 seconds after its last
+# activity, allow a little more for slow (e.g. sanitizer) builds.
+use constant IDLE_TIMEOUT => 2;
+use constant EARLIEST_CLOSE => IDLE_TIMEOUT - 0.5;
+use constant LATEST_CLOSE => IDLE_TIMEOUT + 2.5;
+# Shorter than the time the clients below stay connected
+use constant REQUEST_TIMEOUT => 2;
+
+my $request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Backend echoing everything it receives, never closing the connection itself
+sub echo_server {
+    my $port = shift;
+
+    my $server = IO::Socket::INET->new(Listen => Socket::SOMAXCONN(),
+                                       Proto => 'tcp',
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       ReuseAddr => 1)
+        or die "listen: $!";
+
+    $SIG{CHLD} = 'IGNORE';
+
+    while (my $client = $server->accept()) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid) {
+            $client->close();
+            next;
+        }
+
+        $server->close();
+        while (sysread($client, my $buffer, 4096)) {
+            syswrite($client, $buffer) or last;
+        }
+        exit 0;
+    }
+    die "accept: $!";
+}
+
+sub make_idle_config {
+    my ($idle_port, $default_port, $echo_port) = @_;
+
+    my ($fh, $filename) = File::Temp::tempfile();
+
+    print $fh <<END;
+# Idle timeout test configuration
+
+listen 127.0.0.1 $idle_port {
+    proto http
+    idle_timeout ${\ IDLE_TIMEOUT}
+}
+
+listen 127.0.0.1 $default_port {
+    proto http
+    request_timeout ${\ REQUEST_TIMEOUT}
+}
+
+table {
+    localhost 127.0.0.1 $echo_port
+}
+END
+
+    close($fh);
+
+    return $filename;
+}
+
+# Connect through the proxy to the echo server, returns the socket once the
+# request has been echoed back
+sub connect_through_proxy {
+    my ($what, $port) = @_;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Type => SOCK_STREAM,
+                                       Timeout => 5)
+        or die "$what: couldn't connect to $port: $!\n";
+
+    syswrite($socket, $request) or die "$what: write failed: $!\n";
+    expect_echo($what, $socket, $request);
+
+    return $socket;
+}
+
+sub expect_echo {
+    my ($what, $socket, $expected) = @_;
+    my $select = IO::Select->new($socket);
+    my $received = '';
+    my $deadline = time + 5;
+
+    while (length $received < length $expected) {
+        my $remaining = $deadline - time;
+        die "$what: timed out waiting for echo\n"
+            unless $remaining > 0 && $select->can_read($remaining);
+
+        my $bytes = sysread($socket, my $buffer, 4096);
+        die "$what: disconnected waiting for echo\n" unless $bytes;
+        $received .= $buffer;
+    }
+
+    die "$what: unexpected echo: $received\n" unless $received eq $expected;
+}
+
+# Returns the seconds until the proxy closed $socket, or undef if it is still
+# open after $limit seconds
+sub wait_for_close {
+    my ($what, $socket, $limit) = @_;
+    my $select = IO::Select->new($socket);
+    my $start = time;
+
+    while ((my $remaining = $start + $limit - time) > 0) {
+        next unless $select->can_read($remaining);
+
+        my $bytes = sysread($socket, my $buffer, 4096);
+        return time - $start unless $bytes;
+        die "$what: unexpected data: $buffer\n";
+    }
+
+    return undef;
+}
+
+sub idle_client {
+    my $port = shift;
+    my $what = 'idle client';
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_through_proxy($what, $port);
+
+    my $elapsed = wait_for_close($what, $socket, LATEST_CLOSE);
+    die "$what: not disconnected within ${\ LATEST_CLOSE} seconds\n"
+        unless defined $elapsed;
+    die sprintf("%s: disconnected after %.2f seconds idle, before the %d second idle timeout\n",
+                $what, $elapsed, IDLE_TIMEOUT)
+        if $elapsed < EARLIEST_CLOSE;
+
+    exit 0;
+}
+
+# Exchange a line every half second for twice the idle timeout, then fall
+# silent and expect to be disconnected
+sub active_client {
+    my $port = shift;
+    my $what = 'active client';
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_through_proxy($what, $port);
+    my $start = time;
+
+    for (my $i = 0; time - $start < 2 * IDLE_TIMEOUT; $i++) {
+        sleep(0.5);
+        syswrite($socket, "ping $i\n")
+            or die "$what: disconnected while active: $!\n";
+        expect_echo($what, $socket, "ping $i\n");
+    }
+
+    die "$what: not disconnected after falling silent\n"
+        unless defined wait_for_close($what, $socket, LATEST_CLOSE);
+
+    exit 0;
+}
+
+# Without idle_timeout an established connection stays open
+sub long_lived_client {
+    my $port = shift;
+    my $what = 'client without idle timeout';
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_through_proxy($what, $port);
+
+    die "$what: disconnected\n"
+        if defined wait_for_close($what, $socket, LATEST_CLOSE + 1);
+
+    # and still works
+    syswrite($socket, "still there?\n") or die "$what: write failed: $!\n";
+    expect_echo($what, $socket, "still there?\n");
+
+    exit 0;
+}
+
+sub main {
+    my $idle_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $default_port = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $echo_port = $ENV{TEST_HTTPD_PORT} || 8083;
+
+    my $config = make_idle_config($idle_port, $default_port, $echo_port);
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    my $echo_pid = start_child('server', \&echo_server, $echo_port);
+
+    wait_for_port(port => $echo_port);
+    wait_for_port(port => $idle_port);
+    wait_for_port(port => $default_port);
+
+    start_child('worker', \&idle_client, $idle_port);
+    start_child('worker', \&active_client, $idle_port);
+    start_child('worker', \&long_lived_client, $default_port);
+    wait_for_type('worker');
+
+    kill 15, $proxy_pid;
+    kill 15, $echo_pid;
+    sleep 1;
+
+    unlink($config);
+
+    reap_children();
+}
+
+main();

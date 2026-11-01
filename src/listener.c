@@ -209,9 +209,10 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
 
     existing_listener->log_bad_requests = new_listener->log_bad_requests;
 
-    /* The timeout is read from the listener on every sweep, so this also
-     * applies to connections accepted before the reload */
+    /* Timeouts are read from the listener on every sweep, so these also
+     * apply to connections accepted before the reload */
     existing_listener->request_timeout = new_listener->request_timeout;
+    existing_listener->idle_timeout = new_listener->idle_timeout;
 
     struct Table *new_table =
             table_lookup(tables, existing_listener->table_name);
@@ -265,6 +266,7 @@ new_listener(void) {
     listener->transparent_proxy = 0;
     listener->fallback_use_proxy_header = 0;
     listener->request_timeout = DEFAULT_REQUEST_TIMEOUT;
+    listener->idle_timeout = 0;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
      * are not active */
@@ -498,6 +500,17 @@ int
 accept_listener_request_timeout(struct Listener *listener, const char *timeout) {
     if (!parse_timeout(timeout, &listener->request_timeout)) {
         err("Invalid request_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
+        return -1;
+    }
+
+    return 1;
+}
+
+int
+accept_listener_idle_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->idle_timeout)) {
+        err("Invalid idle_timeout %s, expected a number of seconds "
                 "or 0 to disable", timeout);
         return -1;
     }
@@ -796,6 +809,7 @@ print_listener_config(FILE *file, const struct Listener *listener) {
         fprintf(file, "\treuseport on\n");
 
     fprintf(file, "\trequest_timeout %d\n", listener->request_timeout);
+    fprintf(file, "\tidle_timeout %d\n", listener->idle_timeout);
 
     fprintf(file, "}\n\n");
 }
