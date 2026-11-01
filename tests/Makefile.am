@@ -29,6 +29,7 @@ TESTS += functional_test \
          request_timeout_test \
          reuseport_test \
          slow_client_test \
+         split_host_test \
          transparent_proxy_test
 if DNS_ENABLED
   TESTS += config_test \
