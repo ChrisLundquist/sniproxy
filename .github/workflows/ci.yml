@@ -15,6 +15,12 @@ concurrency:
 env:
   DEBIAN_FRONTEND: noninteractive
 
+# Run steps with bash -eo pipefail rather than the default bash -e, so the
+# exit status of a command piped into tee isn't lost
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: build (${{ matrix.cc }})
@@ -45,8 +51,9 @@ jobs:
       - name: Build
         run: make -j"$(nproc)" all CFLAGS=-Werror
 
-      # Runs as the unprivileged runner user, so transparent_proxy_test and
-      # reload_dns_test report SKIP here; the next step runs them as root.
+      # Runs as the unprivileged runner user, so transparent_proxy_test,
+      # reload_dns_test, resolver_config_test and half_close_dns_test report
+      # SKIP here; the "Test as root" step runs them as root.
       - name: Test
         run: make check CFLAGS=-Werror
 
@@ -64,7 +71,8 @@ jobs:
         working-directory: tests
         run: |
           status=0
-          for t in transparent_proxy_test reload_dns_test; do
+          for t in transparent_proxy_test reload_dns_test resolver_config_test \
+                   half_close_dns_test; do
             echo "::group::$t"
             rc=0
             sudo ./"$t" 2>&1 | tee "root-$t.log" || rc=$?
@@ -194,9 +202,10 @@ jobs:
             tests/test-suite.log
           if-no-files-found: ignore
 
-  # The package jobs run autoreconf rather than autogen.sh: setver.sh would
-  # stamp a version from `git describe`, which does not match AC_INIT
-  # (debian/changelog and the RPM spec would disagree with the tarball).
+  # The package jobs run autoreconf rather than autogen.sh: autogen.sh runs
+  # setver.sh, which rewrites the version in configure.ac and the RPM spec
+  # from `git describe --tags` and adds a debian/changelog entry with
+  # debchange. The packages are built with the version in the repository.
   debian-package:
     name: Debian package
     runs-on: ubuntu-latest
