@@ -120,6 +120,7 @@ listener 192.0.2.10:80 {
     fallback 192.0.2.100:80
     bad_requests log
     source 192.0.2.10
+    request_timeout 10
 
     access_log {
         filename /var/log/sniproxy/http_access.log
@@ -174,6 +175,17 @@ connecting to the backend server. In most cases it is better to omit this
 option and allow the operating system to select the outgoing address
 automatically. Do not include a port number in this address, doing so will
 limit the proxy to one simultaneous to each server at time.
+
+The request_timeout directive sets the number of seconds a client has, from
+when its connection is accepted, to send a request which can be parsed and for
+the server's address to be resolved. Connections which take longer, such as
+clients which send nothing or send their request slowly to hold connections
+open, are closed without a response. The default is 30 seconds, 0 disables the
+timeout.
+
+The timeout is checked once a second, so a connection may be closed up to a
+second after its timeout. Changes take effect on reload, including for
+connections which are already open.
 
 The access log configuration may be overridden on each listener.
 
