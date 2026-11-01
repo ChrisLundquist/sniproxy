@@ -151,6 +151,8 @@ sub main {
 
     $httpd_pid = start_child('server', \&TestHTTPD::httpd, port => $httpd_port2);
     wait_for_port(port => $httpd_port2);
+    # The new listener only exists once sniproxy has processed the SIGHUP
+    wait_for_port(port => $proxy_port3);
 
     for (my $i = 0; $i < $workers; $i++) {
         start_child('worker', \&worker, 'localhost', '', $proxy_port2, $iterations);
