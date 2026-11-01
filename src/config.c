@@ -136,6 +136,16 @@ static const struct Keyword listener_stanza_grammar[] = {
         .keyword="bad_requests",
         .parse_arg= (int(*)(void *, const char *))accept_listener_bad_request_action,
     },
+    /* Keywords are matched by prefix in order: add new keywords after the
+     * existing ones so abbreviations (e.g. "re" for reuseport) still work */
+    {
+        .keyword="request_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_request_timeout,
+    },
+    {
+        .keyword="idle_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_idle_timeout,
+    },
     {
         .keyword = NULL,
     },

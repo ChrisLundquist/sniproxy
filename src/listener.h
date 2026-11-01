@@ -41,6 +41,8 @@ struct Listener {
     struct Logger *access_log;
     int log_bad_requests, reuseport, transparent_proxy, ipv6_v6only;
     int fallback_use_proxy_header;
+    int request_timeout; /* seconds allowed to receive the request, 0 = off */
+    int idle_timeout;    /* seconds without traffic before closing, 0 = off */
 
     /* Runtime fields */
     int reference_count;
@@ -61,6 +63,8 @@ int accept_listener_protocol(struct Listener *, const char *);
 int accept_listener_reuseport(struct Listener *, const char *);
 int accept_listener_ipv6_v6only(struct Listener *, const char *);
 int accept_listener_bad_request_action(struct Listener *, const char *);
+int accept_listener_request_timeout(struct Listener *, const char *);
+int accept_listener_idle_timeout(struct Listener *, const char *);
 
 void add_listener(struct Listener_head *, struct Listener *);
 void init_listeners(struct Listener_head *, const struct Table_head *, struct ev_loop *);
