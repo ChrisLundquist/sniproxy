@@ -136,7 +136,9 @@ sub main {
         push @dns, $socket;
     }
 
-    my ($fh, $config) = File::Temp::tempfile();
+    # Readable by the unprivileged user sniproxy runs as after dropping
+    # privileges, even when root's TMPDIR is private
+    my ($fh, $config) = File::Temp::tempfile(DIR => world_readable_tempdir());
     chmod(0644, $config);
     print $fh <<END;
 resolver {

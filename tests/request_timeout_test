@@ -216,7 +216,9 @@ sub main {
     my $disabled_port = $ENV{SNI_PROXY_PORT3} || 8082;
     my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8083;
 
-    my ($fh, $config) = File::Temp::tempfile();
+    # Readable by the unprivileged user sniproxy runs as after dropping
+    # privileges, even when root's TMPDIR is private
+    my ($fh, $config) = File::Temp::tempfile(DIR => world_readable_tempdir());
     close($fh);
     # sniproxy drops privileges when run as root and must still be able to
     # read the configuration when reloading

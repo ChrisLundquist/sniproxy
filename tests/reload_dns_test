@@ -104,9 +104,21 @@ sub main {
         exit 77;
     }
 
-    my ($fh, $config) = File::Temp::tempfile();
+    # Readable by the unprivileged user sniproxy runs as after dropping
+    # privileges, even when root's TMPDIR is private
+    my $dir = world_readable_tempdir();
+    my ($fh, $config) = File::Temp::tempfile(DIR => $dir);
     chmod(0644, $config);
+    my $error_log = "$dir/error.log";
+    open(my $log_fh, '>', $error_log) or die "open: $!";
+    close($log_fh);
+    chmod(0666, $error_log);
     print $fh <<END;
+error_log {
+    filename $error_log
+    priority notice
+}
+
 resolver {
     nameserver $dns_ip
     mode ipv4_only
@@ -146,6 +158,15 @@ END
     unlink($config);
 
     reap_children();
+
+    # Make sure the reload this test is about actually happened
+    open($log_fh, '<', $error_log) or die "open: $!";
+    my $reloaded = grep { /reloading configuration/ } <$log_fh>;
+    close($log_fh);
+    unless ($reloaded) {
+        print "Test failed: sniproxy didn't reload its configuration\n";
+        exit 1;
+    }
 }
 
 main();

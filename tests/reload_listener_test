@@ -120,7 +120,9 @@ sub main {
     }
     $probe->close();
 
-    my ($fh, $config) = File::Temp::tempfile();
+    # Readable by the unprivileged user sniproxy runs as after dropping
+    # privileges, even when root's TMPDIR is private
+    my ($fh, $config) = File::Temp::tempfile(DIR => world_readable_tempdir());
     close($fh);
     chmod(0644, $config);
     write_config($config, $proxy_port1, $proxy_port2, $proxy_port3, $httpd_port2, 0);
