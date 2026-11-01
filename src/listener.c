@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h> /* INT_MAX */
 #include <assert.h>
 #include <sys/queue.h>
 #include <sys/types.h>
@@ -47,6 +48,12 @@
 #include "protocol.h"
 #include "tls.h"
 #include "http.h"
+
+/*
+ * Seconds a client may take to send a complete request (including resolving
+ * the server's address) unless the listener configures otherwise
+ */
+#define DEFAULT_REQUEST_TIMEOUT 30
 
 static void close_listener(struct ev_loop *, struct Listener *);
 static void accept_cb(struct ev_loop *, struct ev_io *, int);
@@ -202,6 +209,10 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
 
     existing_listener->log_bad_requests = new_listener->log_bad_requests;
 
+    /* The timeout is read from the listener on every sweep, so this also
+     * applies to connections accepted before the reload */
+    existing_listener->request_timeout = new_listener->request_timeout;
+
     struct Table *new_table =
             table_lookup(tables, existing_listener->table_name);
 
@@ -253,6 +264,7 @@ new_listener(void) {
     listener->ipv6_v6only = 0;
     listener->transparent_proxy = 0;
     listener->fallback_use_proxy_header = 0;
+    listener->request_timeout = DEFAULT_REQUEST_TIMEOUT;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
      * are not active */
@@ -457,6 +469,36 @@ accept_listener_bad_request_action(struct Listener *listener, const char *action
         listener->log_bad_requests = 1;
     } else {
         err("Unknown bad_requests action %s, expected log", action);
+        return -1;
+    }
+
+    return 1;
+}
+
+/*
+ * Parse a non-negative whole number of seconds
+ *
+ * Returns 1 on success or 0 if arg is not a valid timeout.
+ */
+static int
+parse_timeout(const char *arg, int *timeout) {
+    char *end;
+
+    errno = 0;
+    long value = strtol(arg, &end, 10);
+    if (errno != 0 || end == arg || *end != '\0' ||
+            value < 0 || value > INT_MAX)
+        return 0;
+
+    *timeout = (int)value;
+    return 1;
+}
+
+int
+accept_listener_request_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->request_timeout)) {
+        err("Invalid request_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
         return -1;
     }
 
@@ -752,6 +794,8 @@ print_listener_config(FILE *file, const struct Listener *listener) {
 
     if (listener->reuseport)
         fprintf(file, "\treuseport on\n");
+
+    fprintf(file, "\trequest_timeout %d\n", listener->request_timeout);
 
     fprintf(file, "}\n\n");
 }

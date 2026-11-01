@@ -142,6 +142,10 @@ Configuration Syntax
         # Specify a server to use if the initial client request doesn't contain
         # a hostname
         fallback 192.0.2.5:443
+
+        # Close connections which have not sent a complete request within 10
+        # seconds (default 30)
+        request_timeout 10
     }
 
     table TableName {

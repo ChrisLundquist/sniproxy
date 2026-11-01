@@ -59,6 +59,12 @@
  * header) with a PROXY header prepended.
  */
 #define MAX_REQUEST_BUFFER_SIZE 32768
+/*
+ * Seconds between sweeps for connections exceeding their listener's request
+ * timeout. Timeouts are configured in whole seconds, so a connection is
+ * closed at most this long after its deadline.
+ */
+#define TIMEOUT_SWEEP_INTERVAL 1.0
 
 
 struct resolv_cb_data {
@@ -70,10 +76,13 @@ struct resolv_cb_data {
 
 
 static TAILQ_HEAD(ConnectionHead, Connection) connections;
+/* One timer shared by all connections, active while any exist */
+static struct ev_timer timeout_watcher;
 
 
 static inline int client_socket_open(const struct Connection *);
 static inline int server_socket_open(const struct Connection *);
+static inline int server_connect_pending(const struct Connection *);
 
 static void reactivate_watcher(struct ev_loop *, struct ev_io *,
         const struct Buffer *, const struct Buffer *);
@@ -89,6 +98,10 @@ static void close_connection(struct Connection *, struct ev_loop *);
 static void close_client_socket(struct Connection *, struct ev_loop *);
 static void abort_connection(struct Connection *);
 static void close_server_socket(struct Connection *, struct ev_loop *);
+static void timeout_cb(struct ev_loop *, struct ev_timer *, int);
+static void check_connection_timeout(struct Connection *, ev_tstamp,
+        struct ev_loop *);
+static void retire_connection(struct Connection *);
 static struct Connection *new_connection(struct ev_loop *);
 static void log_connection(struct Connection *);
 static void log_bad_request(struct Connection *, const char *, size_t, int);
@@ -100,6 +113,8 @@ static void free_resolv_cb_data(struct resolv_cb_data *);
 void
 init_connections(void) {
     TAILQ_INIT(&connections);
+    ev_timer_init(&timeout_watcher, timeout_cb,
+            TIMEOUT_SWEEP_INTERVAL, TIMEOUT_SWEEP_INTERVAL);
 }
 
 /**
@@ -163,6 +178,10 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
 
     ev_io_start(loop, client_watcher);
 
+    /* The sweep stops itself once no connections remain */
+    if (!ev_is_active(&timeout_watcher))
+        ev_timer_again(loop, &timeout_watcher);
+
     if (con->listener->table->use_proxy_header ||
             con->listener->fallback_use_proxy_header)
         insert_proxy_v1_header(con);
@@ -175,6 +194,8 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
  */
 void
 free_connections(struct ev_loop *loop) {
+    ev_timer_stop(loop, &timeout_watcher);
+
     struct Connection *iter;
     while ((iter = TAILQ_FIRST(&connections)) != NULL) {
         TAILQ_REMOVE(&connections, iter, entries);
@@ -235,6 +256,20 @@ static inline int
 server_socket_open(const struct Connection *con) {
     return con->state == CONNECTED ||
         con->state == CLIENT_CLOSED;
+}
+
+/*
+ * Test if we have yet to start connecting to the server
+ *
+ * Returns true iff we are still waiting for the client's request or for the
+ * server's address to be resolved. The request timeout applies to these.
+ */
+static inline int
+server_connect_pending(const struct Connection *con) {
+    return con->state == ACCEPTED ||
+        con->state == PARSED ||
+        con->state == RESOLVING ||
+        con->state == RESOLVED;
 }
 
 /*
@@ -303,16 +338,97 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
         close_server_socket(con, loop);
 
     if (con->state == CLOSED) {
-        TAILQ_REMOVE(&connections, con, entries);
-
-        if (con->listener->access_log)
-            log_connection(con);
-
-        free_connection(con);
+        retire_connection(con);
         return;
     }
 
     reactivate_watchers(con, loop);
+}
+
+/*
+ * Periodic sweep closing connections which have exceeded their listener's
+ * request timeout
+ *
+ * One timer serves every connection rather than each having its own. The
+ * whole queue is examined on each sweep, least recently active first. The
+ * queue is ordered by activity, but request deadlines run from accept time
+ * and timeouts differ per listener (and change on reload), so a connection
+ * which has not timed out does not imply the ones after it have not. Each
+ * check is a few comparisons, small next to the I/O those connections do.
+ */
+static void
+timeout_cb(struct ev_loop *loop, struct ev_timer *w,
+        int revents __attribute__((unused))) {
+    ev_tstamp now = ev_now(loop);
+    struct Connection *con = TAILQ_LAST(&connections, ConnectionHead);
+
+    while (con != NULL) {
+        /* Fetch the next connection first since con may be freed. Timing out
+         * a connection frees only that connection, so prev remains valid. */
+        struct Connection *prev = TAILQ_PREV(con, ConnectionHead, entries);
+
+        check_connection_timeout(con, now, loop);
+
+        con = prev;
+    }
+
+    if (TAILQ_EMPTY(&connections))
+        ev_timer_stop(loop, w); /* restarted by accept_connection() */
+}
+
+/*
+ * Close and free con if it has exceeded its listener's request timeout
+ *
+ * The request timeout limits how long after accepting the connection we may
+ * still be waiting for the client's complete request or resolving the
+ * server's address. It runs from accept time, so it also bounds clients
+ * which trickle their request a byte at a time (slowloris).
+ */
+static void
+check_connection_timeout(struct Connection *con, ev_tstamp now,
+        struct ev_loop *loop) {
+    const struct Listener *listener = con->listener;
+    char client[ADDRESS_BUFFER_SIZE];
+
+    if (listener->request_timeout <= 0 || !server_connect_pending(con) ||
+            now - con->established_timestamp < listener->request_timeout)
+        return;
+
+    display_sockaddr(&con->client.addr, client, sizeof(client));
+
+    if (con->state == RESOLVING)
+        notice("Timed out after %d seconds resolving server address for "
+                "request %.*s from %s, closing connection",
+                listener->request_timeout,
+                con->hostname != NULL ? (int)con->hostname_len : 0,
+                con->hostname != NULL ? con->hostname : "",
+                client);
+    else
+        notice("Request from %s not received within %d seconds, "
+                "closing connection",
+                client, listener->request_timeout);
+
+    /* Discard anything still buffered: an expired connection gets no
+     * further chances to make progress. Closing the client socket cancels
+     * any DNS query in progress, so resolv_cb() will not be called. */
+    close_connection(con, loop);
+    retire_connection(con);
+}
+
+/*
+ * Remove a connection whose sockets have both been closed from the queue,
+ * record it in the access log and free it
+ */
+static void
+retire_connection(struct Connection *con) {
+    assert(con->state == CLOSED);
+
+    TAILQ_REMOVE(&connections, con, entries);
+
+    if (con->listener->access_log)
+        log_connection(con);
+
+    free_connection(con);
 }
 
 static void
@@ -837,6 +953,7 @@ close_client_socket(struct Connection *con, struct ev_loop *loop) {
 
     if (con->state == RESOLVING) {
         resolv_cancel(con->query_handle);
+        con->query_handle = NULL;
         con->state = PARSED;
     }
 
