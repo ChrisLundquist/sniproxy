@@ -14,6 +14,18 @@ our $VERSION = '0.01';
 $SIG{CHLD} = \&REAPER;
 
 my %children;
+my $parent_pid = $$;
+
+# If the test exits without reaping its children, e.g. because its main
+# process died on an unexpected error, stop them rather than leave servers
+# bound to the test ports behind for the next test. Children run this too
+# when they exit, but only the test's main process owns %children.
+END {
+    if ($$ == $parent_pid) {
+        my @running = grep { $children{$_}->{'running'} } keys %children;
+        kill 15, @running if @running;
+    }
+}
 
 sub REAPER {
     my $stiff;
