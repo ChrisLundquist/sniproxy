@@ -3,7 +3,10 @@
 # Verify the listener idle_timeout:
 #  - an established connection with no traffic in either direction for the
 #    idle timeout is closed
-#  - a connection with regular traffic is kept open past the idle timeout
+#  - a connection with regular traffic is kept open past the idle timeout,
+#    including traffic in one direction only, either way
+#  - the idle timeout applies before the connection is established too: a
+#    silent client is closed even with the request timeout disabled
 #  - without idle_timeout (the default) an established connection is kept
 #    open, the request timeout no longer applying once connected
 
@@ -64,8 +67,52 @@ sub echo_server {
     die "accept: $!";
 }
 
+# Backend which, once it has the request, either sends a line every half
+# second for twice the idle timeout without reading anything ('stream'), or
+# reads and discards everything without ever answering ('sink')
+sub one_way_server {
+    my ($port, $mode) = @_;
+
+    my $server = IO::Socket::INET->new(Listen => Socket::SOMAXCONN(),
+                                       Proto => 'tcp',
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       ReuseAddr => 1)
+        or die "listen: $!";
+
+    $SIG{CHLD} = 'IGNORE';
+
+    while (my $client = $server->accept()) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid) {
+            $client->close();
+            next;
+        }
+
+        $server->close();
+        my $data = '';
+        until ($data =~ /\r\n\r\n/) {
+            exit 0 unless sysread($client, my $buffer, 4096);
+            $data .= $buffer;
+        }
+        if ($mode eq 'stream') {
+            my $start = time;
+            for (my $i = 0; time - $start < 2 * IDLE_TIMEOUT; $i++) {
+                syswrite($client, "line $i\n") or exit 0;
+                sleep(0.5);
+            }
+        } else {
+            1 while sysread($client, my $buffer, 4096);
+        }
+        exit 0;
+    }
+    die "accept: $!";
+}
+
 sub make_idle_config {
-    my ($idle_port, $default_port, $echo_port) = @_;
+    my ($idle_port, $default_port, $no_request_timeout_port, $echo_port,
+        $stream_port, $sink_port) = @_;
 
     my ($fh, $filename) = File::Temp::tempfile();
 
@@ -82,8 +129,16 @@ listen 127.0.0.1 $default_port {
     request_timeout ${\ REQUEST_TIMEOUT}
 }
 
+listen 127.0.0.1 $no_request_timeout_port {
+    proto http
+    request_timeout 0
+    idle_timeout ${\ IDLE_TIMEOUT}
+}
+
 table {
     localhost 127.0.0.1 $echo_port
+    stream\\.test 127.0.0.1 $stream_port
+    sink\\.test 127.0.0.1 $sink_port
 }
 END
 
@@ -187,6 +242,80 @@ sub active_client {
     exit 0;
 }
 
+# Only receives, as the server streams for longer than the idle timeout
+sub download_client {
+    my $port = shift;
+    my $what = 'client only receiving';
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Timeout => 5)
+        or die "$what: couldn't connect to $port: $!\n";
+    syswrite($socket, "GET / HTTP/1.1\r\nHost: stream.test\r\n\r\n")
+        or die "$what: write failed: $!\n";
+
+    my $select = IO::Select->new($socket);
+    my $received = '';
+    my $start = time;
+    while (time - $start < 2 * IDLE_TIMEOUT + 3) {
+        next unless $select->can_read(0.5);
+        my $bytes = sysread($socket, my $buffer, 4096);
+        last unless $bytes;
+        $received .= $buffer;
+    }
+    my $lines = () = $received =~ /^line \d+$/mg;
+    die "$what: disconnected after $lines lines, the server sent " .
+        "${\ (4 * IDLE_TIMEOUT)}\n" unless $lines >= 4 * IDLE_TIMEOUT;
+
+    exit 0;
+}
+
+# Only sends, to a server which never answers, for longer than the idle
+# timeout
+sub upload_client {
+    my $port = shift;
+    my $what = 'client only sending';
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Timeout => 5)
+        or die "$what: couldn't connect to $port: $!\n";
+    syswrite($socket, "GET / HTTP/1.1\r\nHost: sink.test\r\n\r\n")
+        or die "$what: write failed: $!\n";
+
+    my $start = time;
+    for (my $i = 0; time - $start < 2 * IDLE_TIMEOUT; $i++) {
+        sleep(0.5);
+        die "$what: disconnected while sending\n"
+            if defined wait_for_close($what, $socket, 0.01);
+        syswrite($socket, "data $i\n")
+            or die "$what: disconnected while sending: $!\n";
+    }
+
+    exit 0;
+}
+
+# Connects but never sends a request, to a listener without a request timeout
+sub silent_client {
+    my $port = shift;
+    my $what = 'silent client without a request timeout';
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Timeout => 5)
+        or die "$what: couldn't connect to $port: $!\n";
+
+    my $elapsed = wait_for_close($what, $socket, LATEST_CLOSE);
+    die "$what: not disconnected by the idle timeout within " .
+        "${\ LATEST_CLOSE} seconds\n" unless defined $elapsed;
+
+    exit 0;
+}
+
 # Without idle_timeout an established connection stays open
 sub long_lived_client {
     my $port = shift;
@@ -208,23 +337,38 @@ sub long_lived_client {
 sub main {
     my $idle_port = $ENV{SNI_PROXY_PORT} || 8080;
     my $default_port = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $no_request_timeout_port = $ENV{SNI_PROXY_PORT3} || 8082;
     my $echo_port = $ENV{TEST_HTTPD_PORT} || 8083;
+    my $stream_port = $ENV{TEST_HTTPD_PORT2} || 8084;
+    my $sink_port = $ENV{TEST_BACKEND_PORT} || 8085;
 
-    my $config = make_idle_config($idle_port, $default_port, $echo_port);
+    my $config = make_idle_config($idle_port, $default_port,
+                                  $no_request_timeout_port, $echo_port,
+                                  $stream_port, $sink_port);
     my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
     my $echo_pid = start_child('server', \&echo_server, $echo_port);
+    my $stream_pid = start_child('server', \&one_way_server, $stream_port, 'stream');
+    my $sink_pid = start_child('server', \&one_way_server, $sink_port, 'sink');
 
     wait_for_port(port => $echo_port);
+    wait_for_port(port => $stream_port);
+    wait_for_port(port => $sink_port);
     wait_for_port(port => $idle_port);
     wait_for_port(port => $default_port);
+    wait_for_port(port => $no_request_timeout_port);
 
     start_child('worker', \&idle_client, $idle_port);
     start_child('worker', \&active_client, $idle_port);
+    start_child('worker', \&download_client, $idle_port);
+    start_child('worker', \&upload_client, $idle_port);
+    start_child('worker', \&silent_client, $no_request_timeout_port);
     start_child('worker', \&long_lived_client, $default_port);
     wait_for_type('worker');
 
     kill 15, $proxy_pid;
     kill 15, $echo_pid;
+    kill 15, $stream_pid;
+    kill 15, $sink_pid;
     sleep 1;
 
     unlink($config);
