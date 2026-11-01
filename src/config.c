@@ -62,6 +62,10 @@ static int end_listener_stanza(struct Config *, struct Listener *);
 static int end_table_stanza(struct Config *, struct Table *);
 static int end_backend(struct Table *, struct Backend *);
 static struct LoggerBuilder *new_logger_builder(void);
+static void free_logger_builder(struct LoggerBuilder *);
+static void free_resolver_config(struct ResolverConfig *);
+static void free_listener_stanza(struct Listener *);
+static void free_table_stanza(struct Table *);
 static int accept_logger_filename(struct LoggerBuilder *, const char *);
 static int accept_logger_syslog_facility(struct LoggerBuilder *, const char *);
 static int accept_logger_priority(struct LoggerBuilder *, const char *);
@@ -146,6 +150,7 @@ static const struct Keyword listener_stanza_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_logger_filename,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_listener_access_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="bad_requests",
@@ -175,6 +180,7 @@ static struct Keyword table_stanza_grammar[] = {
         .create=(void *(*)(void))new_backend,
         .parse_arg=(int(*)(void *, const char *))accept_backend_arg,
         .finalize=(int(*)(void *, void *))end_backend,
+        .free=(void(*)(void *))free_backend,
     },
     {
         .keyword = NULL,
@@ -199,18 +205,21 @@ static struct Keyword global_grammar[] = {
         .create=(void *(*)(void))new_resolver_config,
         .block_grammar=resolver_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_resolver_stanza,
+        .free=(void(*)(void *))free_resolver_config,
     },
     {
         .keyword="error_log",
         .create=(void *(*)(void))new_logger_builder,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_error_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="access_log",
         .create=(void *(*)(void))new_logger_builder,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_global_access_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="listener",
@@ -218,6 +227,7 @@ static struct Keyword global_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_listener_arg,
         .block_grammar=listener_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_listener_stanza,
+        .free=(void(*)(void *))free_listener_stanza,
     },
     {
         .keyword="table",
@@ -225,6 +235,7 @@ static struct Keyword global_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_table_arg,
         .block_grammar=table_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_table_stanza,
+        .free=(void(*)(void *))free_table_stanza,
     },
     {
         .keyword = NULL,
@@ -445,13 +456,16 @@ static int
 end_backend(struct Table *table, struct Backend *backend) {
     if (backend->address == NULL) {
         err("No address specified for table entry %s", backend->pattern);
+        free_backend(backend);
         return -1;
     }
 
     /* Compile the pattern now so an invalid regular expression rejects the
      * configuration, rather than failing at the first lookup */
-    if (!init_backend(backend))
+    if (!init_backend(backend)) {
+        free_backend(backend);
         return -1;
+    }
 
     table->use_proxy_header = table->use_proxy_header ||
                               backend->use_proxy_header;
@@ -618,6 +632,36 @@ new_resolver_config(void) {
     return resolver;
 }
 
+/*
+ * Free the objects a stanza builds when the configuration is rejected before
+ * the stanza's end callback takes them over
+ */
+static void
+free_logger_builder(struct LoggerBuilder *lb) {
+    free((char *)lb->filename);
+    free((char *)lb->syslog_facility);
+    free(lb);
+}
+
+static void
+free_resolver_config(struct ResolverConfig *resolver) {
+    free_string_vector(resolver->nameservers);
+    free_string_vector(resolver->search);
+    free(resolver);
+}
+
+static void
+free_listener_stanza(struct Listener *listener) {
+    /* A new listener has no references yet */
+    listener_ref_put(listener_ref_get(listener));
+}
+
+static void
+free_table_stanza(struct Table *table) {
+    /* A new table has no references yet */
+    table_ref_put(table_ref_get(table));
+}
+
 static size_t
 string_vector_len(char **vector) {
     size_t len = 0;
@@ -732,6 +776,9 @@ accept_resolver_mode(struct ResolverConfig *resolver, const char *mode) {
 
 static int
 end_resolver_stanza(struct Config *config, struct ResolverConfig *resolver) {
+    /* A later resolver block replaces an earlier one */
+    free_string_vector(config->resolver.nameservers);
+    free_string_vector(config->resolver.search);
     config->resolver = *resolver;
     free(resolver);
 

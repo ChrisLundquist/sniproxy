@@ -31,6 +31,7 @@
 
 static const struct Keyword *find_keyword(const struct Keyword *, const char *);
 static int parse_block(void *, FILE *, const struct Keyword *, int);
+static void discard_sub_context(const struct Keyword *, void *, void *);
 
 
 int
@@ -54,14 +55,25 @@ parse_block(void *context, FILE *cfg, const struct Keyword *grammar, int depth) 
         switch (token) {
             case TOKEN_ERROR:
                 err("%s: tokenizer error", __func__);
+                discard_sub_context(keyword, sub_context, context);
                 return -1;
             case TOKEN_WORD:
                 if (keyword && sub_context && keyword->parse_arg) {
                     result = keyword->parse_arg(sub_context, buffer);
-                    if (result <= 0)
+                    if (result <= 0) {
+                        discard_sub_context(keyword, sub_context, context);
                         return result;
+                    }
 
-                } else if ((keyword = find_keyword(grammar, buffer))) {
+                    break;
+                }
+
+                /* A new statement: free anything the previous one left
+                 * pending, e.g. a block keyword not followed by its block */
+                discard_sub_context(keyword, sub_context, context);
+                sub_context = NULL;
+
+                if ((keyword = find_keyword(grammar, buffer))) {
                     if (keyword->create) {
                         sub_context = keyword->create();
                         if (sub_context == NULL) {
@@ -75,8 +87,10 @@ parse_block(void *context, FILE *cfg, const struct Keyword *grammar, int depth) 
                     /* Special case for wildcard grammars i.e. tables */
                     if (keyword->keyword == NULL && keyword->parse_arg) {
                         result = keyword->parse_arg(sub_context, buffer);
-                        if (result <= 0)
+                        if (result <= 0) {
+                            discard_sub_context(keyword, sub_context, context);
                             return result;
+                        }
                     }
                 } else {
                     err("%s: unknown keyword %s", __func__, buffer);
@@ -87,16 +101,22 @@ parse_block(void *context, FILE *cfg, const struct Keyword *grammar, int depth) 
                 if (keyword && sub_context && keyword->block_grammar) {
                     result = parse_block(sub_context, cfg,
                                          keyword->block_grammar, depth + 1);
-                    if (result > 0 && keyword->finalize)
-                        result = keyword->finalize(context, sub_context);
-
-                    if (result <= 0)
+                    if (result <= 0) {
+                        discard_sub_context(keyword, sub_context, context);
                         return result;
+                    }
+
+                    if (keyword->finalize) {
+                        result = keyword->finalize(context, sub_context);
+                        if (result <= 0)
+                            return result;
+                    }
 
                     keyword = NULL;
                     sub_context = NULL;
                 } else {
                     err("%s: block without context", __func__);
+                    discard_sub_context(keyword, sub_context, context);
                     return -1;
                 }
                 break;
@@ -147,4 +167,16 @@ find_keyword(const struct Keyword *grammar, const char *word) {
         return grammar;
 
     return NULL;
+}
+
+/*
+ * Free a sub context created for keyword which won't be handed to its
+ * finalize callback
+ */
+static void
+discard_sub_context(const struct Keyword *keyword, void *sub_context,
+        void *context) {
+    if (keyword != NULL && keyword->create != NULL && keyword->free != NULL &&
+            sub_context != NULL && sub_context != context)
+        keyword->free(sub_context);
 }

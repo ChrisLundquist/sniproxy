@@ -158,6 +158,11 @@ my @cases = (
     },
 );
 
+# In a sanitizer build, make any error AddressSanitizer reports, including a
+# leak of the partly built configuration when it is rejected, give an exit
+# status other than the 1 of an orderly rejection. Other builds ignore it.
+$ENV{ASAN_OPTIONS} = join(':', grep { defined && length } $ENV{ASAN_OPTIONS}, 'exitcode=97');
+
 my $failures = 0;
 
 foreach my $case (@cases) {

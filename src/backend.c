@@ -34,7 +34,6 @@
 #include "logger.h"
 
 
-static void free_backend(struct Backend *);
 static const char *backend_config_options(const struct Backend *);
 
 
@@ -182,7 +181,7 @@ remove_backend(struct Backend_head *head, struct Backend *backend) {
     free_backend(backend);
 }
 
-static void
+void
 free_backend(struct Backend *backend) {
     if (backend == NULL)
         return;
