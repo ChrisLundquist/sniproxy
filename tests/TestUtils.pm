@@ -5,9 +5,10 @@ use strict;
 use POSIX ":sys_wait_h";
 use IO::Socket::INET;
 require File::Temp;
+require File::Spec;
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT = qw(start_child reap_children wait_for_type wait_for_port make_config);
+our @EXPORT = qw(start_child reap_children wait_for_type wait_for_port make_config world_readable_tempdir);
 our $VERSION = '0.01';
 
 $SIG{CHLD} = \&REAPER;
@@ -160,6 +161,35 @@ END
     close ($fh);
 
     return $filename;
+}
+
+# Can other users reach the directory, i.e. search it and all its parents
+sub world_searchable($) {
+    my @dirs = File::Spec->splitdir(File::Spec->rel2abs(shift));
+
+    while (@dirs) {
+        my @st = stat(File::Spec->catdir(@dirs))
+            or return 0;
+        return 0 unless $st[2] & 0001;
+        pop @dirs;
+    }
+
+    return 1;
+}
+
+# Started as root, sniproxy drops privileges (to the daemon user by default)
+# and still has to read its configuration and reopen its log files on reload.
+# Return a new directory for such files that the unprivileged user can reach:
+# in TMPDIR unless other users can't get to it, otherwise in /tmp.
+sub world_readable_tempdir() {
+    my $parent = File::Spec->tmpdir;
+    $parent = '/tmp' if $< == 0 && !world_searchable($parent);
+
+    my $dir = File::Temp::tempdir('sniproxy-test-XXXXXX',
+                                  DIR => $parent, CLEANUP => 1);
+    chmod(0755, $dir) or die("chmod(): $!");
+
+    return $dir;
 }
 
 1;

@@ -42,8 +42,10 @@ sub make_config($$$) {
     my $proxy_port2 = shift;
     my $httpd_port = shift;
 
-    my ($fh, $filename) = File::Temp::tempfile();
-    my ($unused, $logfile) = File::Temp::tempfile();
+    # sniproxy rereads the config after dropping privileges
+    my $dir = world_readable_tempdir();
+    my ($fh, $filename) = File::Temp::tempfile(DIR => $dir);
+    my ($unused, $logfile) = File::Temp::tempfile(DIR => $dir);
     chmod(0644, $filename);
     chmod(0666, $logfile);
 
