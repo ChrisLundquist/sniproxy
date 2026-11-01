@@ -2,7 +2,7 @@ package TestUtils;
 
 use warnings;
 use strict;
-use POSIX ":sys_wait_h";
+use POSIX qw(:sys_wait_h :signal_h);
 use IO::Socket::INET;
 require File::Temp;
 require Exporter;
@@ -32,11 +32,17 @@ sub start_child {
     my $child = shift;
     my @args = @_;
 
+    # Block SIGCHLD until the child is registered, otherwise REAPER may reap
+    # a short lived child first and we would then mark it running forever
+    my $sigchld = POSIX::SigSet->new(SIGCHLD);
+    sigprocmask(SIG_BLOCK, $sigchld) or die("sigprocmask: $!");
+
     my $pid = fork();
     if (not defined $pid) {
         die("fork: $!");
     } elsif ($pid == 0) {
         undef $SIG{CHLD};
+        sigprocmask(SIG_UNBLOCK, $sigchld) or die("sigprocmask: $!");
         $child->(@args);
         # Should not be reached
         exit(99);
@@ -50,6 +56,8 @@ sub start_child {
         signal => undef,
         exit_core => undef,
     };
+
+    sigprocmask(SIG_UNBLOCK, $sigchld) or die("sigprocmask: $!");
 
     return $pid;
 }
