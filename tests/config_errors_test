@@ -67,6 +67,47 @@ my @cases = (
         valid => 1,
         output => qr/^pidfile \/tmp\/sniproxy\.pid$/m,
     },
+    {
+        name => 'IPv4 and IPv6 nameservers and search domains accepted',
+        config => "resolver {\n    nameserver 192.0.2.53\n    nameserver 2001:db8::53\n" .
+                  "    search one.example\n    search two.example\n}\n",
+        valid => 1,
+        output => qr/^\tnameserver 192\.0\.2\.53\n\tnameserver 2001:db8::53\n\tsearch one\.example\n\tsearch two\.example$/m,
+    },
+    {
+        # udns can not use a port: it used to be dropped silently, with
+        # queries going to 127.0.0.1:53 instead
+        name => 'nameserver with port',
+        config => "resolver {\n    nameserver 192.0.2.53:5353\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'bracketed IPv6 nameserver with port',
+        config => "resolver {\n    nameserver [2001:db8::53]:53\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'unix socket nameserver',
+        config => "resolver {\n    nameserver unix:/tmp/dns.sock\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'hostname nameserver',
+        config => "resolver {\n    nameserver dns.example\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'six nameservers accepted',
+        config => "resolver {\n" . join('', map { "    nameserver 192.0.2.$_\n" } 1..6) . "}\n",
+        valid => 1,
+        output => qr/^\tnameserver 192\.0\.2\.6$/m,
+    },
+    {
+        # udns supports at most six, more used to be dropped silently
+        name => 'seven nameservers',
+        config => "resolver {\n" . join('', map { "    nameserver 192.0.2.$_\n" } 1..7) . "}\n",
+        valid => 0,
+    },
 );
 
 my $failures = 0;

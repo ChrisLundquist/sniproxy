@@ -119,10 +119,20 @@ resolv_init(struct ev_loop *loop, char **nameservers, char **search, int mode) {
         /* Nameservers not specified, use system resolver config */
         dns_init(ctx, 0);
     } else {
+        /*
+         * dns_reset() leaves the context in the same state dns_init() does
+         * before it reads /etc/resolv.conf, and dns_open() is called below.
+         */
         dns_reset(ctx);
 
+        /*
+         * A name server udns rejects must not be skipped: with none left
+         * dns_open() would fall back to 127.0.0.1.
+         */
         for (int i = 0; nameservers[i] != NULL; i++)
-            dns_add_serv(ctx, nameservers[i]);
+            if (dns_add_serv(ctx, nameservers[i]) < 0)
+                fatal("Unable to use nameserver %s: %s",
+                        nameservers[i], strerror(errno));
     }
 
     /* Configured search domains replace the system's, whether or not
@@ -130,7 +140,9 @@ resolv_init(struct ev_loop *loop, char **nameservers, char **search, int mode) {
     if (search != NULL) {
         dns_add_srch(ctx, NULL);
         for (int i = 0; search[i] != NULL; i++)
-            dns_add_srch(ctx, search[i]);
+            if (dns_add_srch(ctx, search[i]) < 0)
+                fatal("Unable to use search domain %s: %s",
+                        search[i], strerror(errno));
     }
 
     /* Keep the documented IPv4 only default unless a mode was configured */
