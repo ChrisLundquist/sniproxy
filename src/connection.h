@@ -58,8 +58,12 @@ struct Connection {
     size_t hostname_len;
     size_t header_len;
     struct ResolvQuery *query_handle;
-    ev_tstamp established_timestamp;
-    ev_tstamp connect_timestamp; /* when we started connecting to the server */
+    ev_tstamp established_timestamp; /* wall clock (ev_now()), for reporting */
+    /* monotonic_time() when the connection was accepted, and when we started
+     * connecting to the server: timeouts are measured on this clock so that
+     * stepping the wall clock doesn't trigger or suspend them */
+    ev_tstamp accepted_monotonic;
+    ev_tstamp connect_monotonic;
     int use_proxy_header;
 
     TAILQ_ENTRY(Connection) entries;

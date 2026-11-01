@@ -34,6 +34,11 @@ AC_ARG_ENABLE([rfc3339-timestamps],
 
 AC_CHECK_FUNCS([accept4])
 
+# Timeouts are measured with clock_gettime(CLOCK_MONOTONIC), which older
+# C libraries provide in librt
+AC_SEARCH_LIBS([clock_gettime], [rt], [],
+               [AC_MSG_ERROR([clock_gettime() is required])])
+
 # Enable large file support (so we can log more than 2GB)
 AC_SYS_LARGEFILE
 

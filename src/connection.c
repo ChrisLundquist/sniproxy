@@ -177,6 +177,7 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
     con->client.watcher.data = con;
     con->state = ACCEPTED;
     con->established_timestamp = ev_now(loop);
+    con->accepted_monotonic = monotonic_time();
 
     TAILQ_INSERT_HEAD(&connections, con, entries);
 
@@ -439,7 +440,7 @@ relay_shutdowns(struct Connection *con, struct ev_loop *loop) {
 static void
 timeout_cb(struct ev_loop *loop, struct ev_timer *w,
         int revents __attribute__((unused))) {
-    ev_tstamp now = ev_now(loop);
+    ev_tstamp now = monotonic_time();
     struct Connection *con = TAILQ_LAST(&connections, ConnectionHead);
 
     while (con != NULL) {
@@ -477,7 +478,7 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
     char client[ADDRESS_BUFFER_SIZE];
 
     if (listener->request_timeout > 0 && server_connect_pending(con) &&
-            now - con->established_timestamp >= listener->request_timeout) {
+            now - con->accepted_monotonic >= listener->request_timeout) {
         display_sockaddr(&con->client.addr, client, sizeof(client));
 
         if (con->state == RESOLVING)
@@ -521,20 +522,19 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
 }
 
 /*
- * Time of the most recent receive or send on either socket
+ * monotonic_time() of the most recent receive or send on either socket, or of
+ * accepting the connection or starting to connect to the server if later
  */
 static ev_tstamp
 connection_last_activity(const struct Connection *con) {
-    ev_tstamp last = con->established_timestamp;
+    ev_tstamp last = con->accepted_monotonic;
 
     /* Starting to connect to the server counts too: time spent resolving
      * the server's address is covered by the request timeout, and must not
      * count as idle time once the connection is established */
-    last = MAX(last, con->connect_timestamp);
-    last = MAX(last, con->client.buffer->last_recv);
-    last = MAX(last, con->client.buffer->last_send);
-    last = MAX(last, con->server.buffer->last_recv);
-    last = MAX(last, con->server.buffer->last_send);
+    last = MAX(last, con->connect_monotonic);
+    last = MAX(last, con->client.buffer->last_activity);
+    last = MAX(last, con->server.buffer->last_activity);
 
     return last;
 }
@@ -1073,7 +1073,7 @@ initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
     ev_io_init(server_watcher, connection_cb, sockfd, EV_WRITE);
     con->server.watcher.data = con;
     con->state = CONNECTED;
-    con->connect_timestamp = ev_now(loop);
+    con->connect_monotonic = monotonic_time();
 
     ev_io_start(loop, server_watcher);
 }
