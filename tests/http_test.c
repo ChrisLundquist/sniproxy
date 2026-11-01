@@ -44,6 +44,17 @@ static const char *bad[] = {
         "Accept: */*\r\n"
         "\r\n",
 };
+static const char *incomplete[] = {
+    "GET / HTTP/1.1\r\n"
+        "Host: exam",
+    "GET / HTTP/1.1\r\n"
+        "Host: example.com\r",
+    "GET / HTTP/1.1\n"
+        "Host: example.com",
+    "GET / HTTP/1.1\r\n"
+        "Accept: */*\r\n"
+        "\r",
+};
 
 int main(void) {
     unsigned int i;
@@ -92,6 +103,37 @@ int main(void) {
                 free(hostname);
             }
         }
+    }
+
+    /* A line is only complete once its <LF> has arrived: a request cut off
+     * inside the Host header (or the blank line) is incomplete, it must not
+     * be routed on "exam" or reported as having no Host header */
+    for (i = 0; i < sizeof(incomplete) / sizeof(const char *); i++) {
+        hostname = NULL;
+
+        result = http_protocol->parse_packet(incomplete[i], strlen(incomplete[i]), &hostname);
+
+        assert(result == -1);
+
+        assert(hostname == NULL);
+    }
+
+    /* Once the Host line is complete the full hostname is available, without
+     * waiting for the rest of the headers */
+    {
+        static const char complete_host[] = "GET / HTTP/1.1\r\nHost: example.com\r\n";
+
+        hostname = NULL;
+
+        result = http_protocol->parse_packet(complete_host, sizeof(complete_host) - 1, &hostname);
+
+        assert(result == 11);
+
+        assert(NULL != hostname);
+
+        assert(0 == strcmp("example.com", hostname));
+
+        free(hostname);
     }
 
     return 0;
