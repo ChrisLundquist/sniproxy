@@ -263,6 +263,14 @@ sub main {
         kill 1, $proxy_pid;
         expect_closed_within('open client after enabling request_timeout on reload',
                              $idle_socket, LATEST_CLOSE);
+
+        # With no connections left the timeout sweep stops, and the next
+        # connection must start it again
+        close($idle_socket);
+        sleep 2;
+        my $late_socket = connect_to($http_port);
+        expect_closed_within('silent client connecting once no other ' .
+                             'connections remained', $late_socket, LATEST_CLOSE);
         1;
     };
     print "Test failed: $@" if $failed;
