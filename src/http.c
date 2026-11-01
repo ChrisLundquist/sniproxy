@@ -108,6 +108,15 @@ get_header(const char *header, const char *data, size_t data_len, char **value) 
             while (header_len < len && isblank((unsigned char)data[header_len]))
                 header_len++;
 
+            /* and trailing whitespace, which isn't part of the field value
+             * either (RFC 7230 section 3.2) */
+            while (len > header_len && isblank((unsigned char)data[len - 1]))
+                len--;
+
+            /* An empty Host header doesn't name a host */
+            if (len == header_len)
+                return -2;
+
             *value = malloc(len - header_len + 1);
             if (*value == NULL)
                 return -4;
