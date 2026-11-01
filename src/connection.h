@@ -59,6 +59,7 @@ struct Connection {
     size_t header_len;
     struct ResolvQuery *query_handle;
     ev_tstamp established_timestamp;
+    ev_tstamp connect_timestamp; /* when we started connecting to the server */
     int use_proxy_header;
 
     TAILQ_ENTRY(Connection) entries;

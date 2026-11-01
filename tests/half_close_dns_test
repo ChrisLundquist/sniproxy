@@ -1,0 +1,188 @@
+#!/usr/bin/env perl
+
+# Time spent resolving the server's address is covered by the request
+# timeout, not the half close timeout: a client which half-closes right after
+# its request, while the address is still being resolved, must not have its
+# connection dropped as soon as the server connection starts because the
+# resolution counted as idle time.
+#
+# The name server answers late, and the server's listen queue is full so its
+# kernel drops our SYNs and the server connection stays pending. The
+# connection must then last half_close_timeout from when the connect started,
+# not from when the client half-closed.
+#
+# This needs to run a fake name server on port 53, so it is skipped unless
+# run as root.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use File::Temp;
+use IO::Socket::INET;
+use IO::Select;
+use Socket;
+use Time::HiRes qw(time sleep);
+
+my $dns_ip = '127.0.0.10';
+my $dns_delay = 3;
+my $half_close_timeout = 2;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Answer every A query with 127.0.0.1, after a delay
+sub slow_dns_server($) {
+    my $server = shift;
+
+    $SIG{CHLD} = 'IGNORE';
+
+    while (1) {
+        my $query;
+        my $peer = $server->recv($query, 512);
+        next unless defined $peer && length($query) > 12;
+
+        my $pid = fork();
+        next if $pid;
+        die "fork: $!" unless defined $pid;
+
+        sleep $dns_delay;
+
+        my $pos = 12;
+        while ($pos < length($query) && (my $len = ord(substr($query, $pos, 1))) != 0) {
+            $pos += $len + 1;
+        }
+        my $qtype = unpack('n', substr($query, $pos + 1, 2));
+        my $question = substr($query, 12, $pos + 5 - 12);
+
+        my $answer = '';
+        my $ancount = 0;
+        if ($qtype == 1) {
+            $answer = pack('n n n N n', 0xc00c, 1, 1, 60, 4) . inet_aton('127.0.0.1');
+            $ancount = 1;
+        }
+        $server->send(substr($query, 0, 2) . pack('n n n n n', 0x8180, 1, $ancount, 0, 0) .
+                      $question . $answer, 0, $peer);
+        exit 0;
+    }
+}
+
+# Returns undef on success, 'skip', or an error message
+sub client($) {
+    my $port = shift;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp')
+        or die "connect: $!\n";
+    syswrite($socket, "GET / HTTP/1.1\r\nHost: slow.example\r\n\r\n")
+        or die "write: $!\n";
+    shutdown($socket, 1) or die "shutdown: $!\n";
+    my $start = time();
+
+    # Wait for sniproxy to close the connection
+    my $select = IO::Select->new($socket);
+    my $response = '';
+    while (time() - $start < $dns_delay + $half_close_timeout + 5) {
+        next unless $select->can_read(0.2);
+        my $bytes = sysread($socket, my $chunk, 4096);
+        last unless $bytes;
+        $response .= $chunk;
+    }
+    my $elapsed = time() - $start;
+
+
+    return sprintf("Connection closed %.1fs after the client half-closed, " .
+                   "before half_close_timeout had elapsed since the server " .
+                   "connection started (at %ds)", $elapsed, $dns_delay)
+        if $elapsed < $dns_delay + $half_close_timeout - 0.5;
+    return sprintf("Connection still open after %.1fs", $elapsed)
+        if $elapsed >= $dns_delay + $half_close_timeout + 5;
+
+    return undef;
+}
+
+# A listening socket whose accept queue is full: the kernel drops further
+# SYNs, so connecting to it stays pending
+sub stalled_server($) {
+    my $port = shift;
+
+    socket(my $listener, AF_INET, SOCK_STREAM, 0) or die "socket: $!";
+    setsockopt($listener, SOL_SOCKET, SO_REUSEADDR, 1) or die "setsockopt: $!";
+    bind($listener, pack_sockaddr_in($port, inet_aton('127.0.0.1'))) or die "bind: $!";
+    listen($listener, 0) or die "listen: $!";
+
+    my @fillers;
+    for (1 .. 4) {
+        push @fillers, IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                             PeerPort => $port,
+                                             Proto => 'tcp',
+                                             Blocking => 0);
+    }
+    sleep 0.3;
+
+    return ($listener, @fillers);
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $backend_port = $ENV{TEST_HTTPD_PORT} || 8081;
+
+    if ($> != 0) {
+        print "Not running as root, skipping\n";
+        exit 77;
+    }
+
+    my $dns = IO::Socket::INET->new(LocalAddr => $dns_ip,
+                                    LocalPort => 53,
+                                    Proto => 'udp');
+    unless ($dns) {
+        print "Unable to bind $dns_ip:53, skipping\n";
+        exit 77;
+    }
+
+    my $dir = world_readable_tempdir();
+    my $config = "$dir/sniproxy.conf";
+    open(my $fh, '>', $config) or die "open: $!";
+    print $fh <<END;
+resolver {
+    nameserver $dns_ip
+    mode ipv4_only
+}
+
+listen 127.0.0.1 $proxy_port {
+    proto http
+    table backends
+    half_close_timeout $half_close_timeout
+}
+
+table backends {
+    ^slow\\.example\$ slow.example $backend_port
+}
+END
+    close($fh);
+    chmod(0644, $config);
+
+    my @stalled = stalled_server($backend_port);
+    start_child('server', \&slow_dns_server, $dns);
+    $dns->close();
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    wait_for_port(port => $proxy_port);
+
+    my $result = client($proxy_port);
+
+    kill 15, $proxy_pid;
+    sleep 1;
+    reap_children();
+
+    if (defined $result) {
+        print "Test failed: $result\n";
+        exit 1;
+    }
+}
+
+main();

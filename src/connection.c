@@ -527,6 +527,10 @@ static ev_tstamp
 connection_last_activity(const struct Connection *con) {
     ev_tstamp last = con->established_timestamp;
 
+    /* Starting to connect to the server counts too: time spent resolving
+     * the server's address is covered by the request timeout, and must not
+     * count as idle time once the connection is established */
+    last = MAX(last, con->connect_timestamp);
     last = MAX(last, con->client.buffer->last_recv);
     last = MAX(last, con->client.buffer->last_send);
     last = MAX(last, con->server.buffer->last_recv);
@@ -1069,6 +1073,7 @@ initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
     ev_io_init(server_watcher, connection_cb, sockfd, EV_WRITE);
     con->server.watcher.data = con;
     con->state = CONNECTED;
+    con->connect_timestamp = ev_now(loop);
 
     ev_io_start(loop, server_watcher);
 }

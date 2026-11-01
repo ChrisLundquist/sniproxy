@@ -39,7 +39,8 @@ if DNS_ENABLED
            bad_dns_request_test \
            reload_dns_test \
            request_timeout_dns_test \
-           resolver_config_test
+           resolver_config_test \
+           half_close_dns_test
 endif
 
 check_PROGRAMS = http_test \
