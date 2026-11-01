@@ -32,7 +32,8 @@ if DNS_ENABLED
            resolv_test \
            config_errors_test \
            bad_dns_request_test \
-           reload_dns_test
+           reload_dns_test \
+           resolver_config_test
 endif
 
 check_PROGRAMS = http_test \

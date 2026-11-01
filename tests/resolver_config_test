@@ -1,0 +1,189 @@
+#!/usr/bin/env perl
+
+# Resolve hostname backends through the name servers and search domains
+# configured in the resolver block.
+#
+# Two fake name servers are configured: the first refuses every query, so
+# answers only come back if every configured name server is used, not just the
+# first. The answers are only known by the second of two search domains, so a
+# bare name only resolves if every configured search domain is used. Nothing
+# listens on 127.0.0.1:53, where udns falls back to if it was left without a
+# name server.
+#
+# This needs to run fake name servers on port 53, so it is skipped unless run
+# as root.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+use File::Temp;
+use IO::Socket::INET;
+use Socket;
+
+my $refusing_dns_ip = '127.0.0.10';
+my $dns_ip = '127.0.0.11';
+my %records = (
+    'www.example.test' => '127.0.0.1',
+    'web.example.test' => '127.0.0.1',
+);
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Answer A queries for %records, NODATA for other types of those names and
+# NXDOMAIN for everything else, or REFUSED for everything if $refuse
+sub dns_server($$) {
+    my ($server, $refuse) = @_;
+
+    while (1) {
+        my $query;
+        my $peer = $server->recv($query, 512);
+        next unless defined $peer && length($query) > 12;
+
+        # Read the question name
+        my $pos = 12;
+        my @labels;
+        while ($pos < length($query) && (my $len = ord(substr($query, $pos, 1))) != 0) {
+            push @labels, substr($query, $pos + 1, $len);
+            $pos += $len + 1;
+        }
+        next if $pos + 5 > length($query);
+        my $name = lc(join('.', @labels));
+        my $qtype = unpack('n', substr($query, $pos + 1, 2));
+        my $question = substr($query, 12, $pos + 5 - 12);
+
+        my $rcode;
+        my $answer = '';
+        my $ancount = 0;
+        if ($refuse) {
+            $rcode = 5;
+        } elsif (exists $records{$name}) {
+            $rcode = 0;
+            if ($qtype == 1) {
+                $answer = pack('n n n N n', 0xc00c, 1, 1, 60, 4) . inet_aton($records{$name});
+                $ancount = 1;
+            }
+        } else {
+            $rcode = 3;
+        }
+
+        my $response = substr($query, 0, 2) . pack('n n n n n', 0x8180 | $rcode, 1, $ancount, 0, 0) .
+                       $question . $answer;
+        $server->send($response, 0, $peer);
+    }
+}
+
+sub client($$) {
+    my ($port, $hostname) = @_;
+
+    # The listener accepts connections before the resolver is initialized,
+    # so a proxy stuck there would leave us waiting forever
+    $SIG{ALRM} = sub {
+        print "FAIL: $hostname: timed out waiting for a response\n";
+        exit 1;
+    };
+    alarm 20;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Type => SOCK_STREAM)
+        or die "couldn't connect $!";
+
+    $socket->send("GET / HTTP/1.1\r\nHost: $hostname\r\n\r\n");
+
+    my $response = '';
+    while (1) {
+        my $buffer;
+        my $result = $socket->recv($buffer, 4096);
+        last unless defined $result && length($buffer);
+        $response .= $buffer;
+    }
+    $socket->close();
+
+    unless ($response =~ m/\AHTTP\/1\.1 200 /) {
+        my ($status) = split(/\r?\n/, $response);
+        print "FAIL: $hostname: " . ($status // 'no response') . "\n";
+        exit 1;
+    }
+    exit 0;
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8081;
+
+    if ($> != 0) {
+        print "Not running as root, skipping\n";
+        exit 77;
+    }
+
+    my @dns;
+    foreach my $ip ($refusing_dns_ip, $dns_ip) {
+        my $socket = IO::Socket::INET->new(LocalAddr => $ip,
+                                           LocalPort => 53,
+                                           Proto => 'udp');
+        unless ($socket) {
+            print "Unable to bind $ip:53, skipping\n";
+            exit 77;
+        }
+        push @dns, $socket;
+    }
+
+    my ($fh, $config) = File::Temp::tempfile();
+    chmod(0644, $config);
+    print $fh <<END;
+resolver {
+    nameserver $refusing_dns_ip
+    nameserver $dns_ip
+    search other.test
+    search example.test
+    mode ipv4_only
+}
+
+listen 127.0.0.1 $proxy_port {
+    proto http
+    table backends
+}
+
+table backends {
+    .* *:$httpd_port
+}
+END
+    close($fh);
+
+    start_child('server', \&dns_server, $dns[0], 1);
+    start_child('server', \&dns_server, $dns[1], 0);
+    $_->close() foreach @dns;
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    start_child('server', \&TestHTTPD::httpd, port => $httpd_port);
+
+    wait_for_port(port => $proxy_port);
+    wait_for_port(port => $httpd_port);
+
+    # Fully qualified name, and a bare name found through the second search
+    # domain
+    foreach my $hostname ('www.example.test', 'web') {
+        start_child('worker', \&client, $proxy_port, $hostname);
+    }
+
+    wait_for_type('worker');
+
+    sleep 1;
+    kill 15, $proxy_pid;
+    sleep 1;
+    # A proxy that never reached its event loop can not handle SIGTERM
+    kill 9, $proxy_pid if kill(0, $proxy_pid);
+
+    unlink($config);
+
+    reap_children();
+}
+
+main();
