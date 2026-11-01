@@ -102,7 +102,7 @@ This is the preferred installation method for modern Fedora based distributions.
         sudo yum install ../sniproxy-<version>.<arch>.rpm
 
 I've used Scientific Linux 6 a fair amount, but I prefer Debian based
-distributions. RPM builds are tested in Travis-CI on Ubuntu, but not natively.
+distributions. RPM builds are tested in GitHub Actions on Ubuntu, but not natively.
 This build process may not follow the current Fedora packaging standards, and
 may not even work.
 
