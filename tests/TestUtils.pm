@@ -32,11 +32,20 @@ sub start_child {
     my $child = shift;
     my @args = @_;
 
+    # Block SIGCHLD until the child is recorded in %children, otherwise a
+    # child that exits immediately can be reaped by REAPER first and then
+    # be marked as running forever, hanging wait_for_type().
+    my $sigchld = POSIX::SigSet->new(POSIX::SIGCHLD());
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $sigchld)
+        or die("sigprocmask: $!");
+
     my $pid = fork();
     if (not defined $pid) {
         die("fork: $!");
     } elsif ($pid == 0) {
         undef $SIG{CHLD};
+        POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigchld)
+            or die("sigprocmask: $!");
         $child->(@args);
         # Should not be reached
         exit(99);
@@ -50,6 +59,9 @@ sub start_child {
         signal => undef,
         exit_core => undef,
     };
+
+    POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigchld)
+        or die("sigprocmask: $!");
 
     return $pid;
 }
