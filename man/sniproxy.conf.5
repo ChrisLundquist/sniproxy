@@ -170,8 +170,12 @@ request. If no table directive is specified the default, unnamed, table will be
 used.
 
 The fallback directive specifies a server to be used if the client request can
-not be parsed, a server can not be found in the table for the hostname
-specified or the hostname can not be resolved.. This should be an IP address
+not be parsed or does not include a hostname, or no table entry matches the
+hostname. A request without a hostname is still looked up in the table first,
+as an empty hostname, so a catch-all pattern such as .* takes it before the
+fallback does. Without a fallback these requests receive the protocol's abort
+message (an HTTP 503 response or a TLS alert). The fallback is not used when the
+address of a hostname backend can't be resolved. This should be an IP address
 and port or unix socket path.
 
 The bad_requests directive allows logging the contents of the client request if
