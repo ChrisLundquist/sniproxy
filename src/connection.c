@@ -65,6 +65,14 @@
  * is closed at most this long after its deadline.
  */
 #define TIMEOUT_SWEEP_INTERVAL 1.0
+/*
+ * Most connections a sweep closes before letting the event loop run again:
+ * many connections can expire at once, e.g. a burst of clients which never
+ * send their request, and closing them all in one go would stall the other
+ * connections. The sweep continues after TIMEOUT_SWEEP_CONTINUE seconds.
+ */
+#define TIMEOUT_SWEEP_MAX_CLOSE 256
+#define TIMEOUT_SWEEP_CONTINUE 0.01
 
 
 struct resolv_cb_data {
@@ -102,7 +110,7 @@ static void close_client_socket(struct Connection *, struct ev_loop *);
 static void abort_connection(struct Connection *);
 static void close_server_socket(struct Connection *, struct ev_loop *);
 static void timeout_cb(struct ev_loop *, struct ev_timer *, int);
-static void check_connection_timeout(struct Connection *, ev_tstamp,
+static int check_connection_timeout(struct Connection *, ev_tstamp,
         struct ev_loop *);
 static ev_tstamp connection_last_activity(const struct Connection *);
 static void retire_connection(struct Connection *);
@@ -119,6 +127,10 @@ init_connections(void) {
     TAILQ_INIT(&connections);
     ev_timer_init(&timeout_watcher, timeout_cb,
             TIMEOUT_SWEEP_INTERVAL, TIMEOUT_SWEEP_INTERVAL);
+    /* Run after the I/O callbacks pending in the same loop iteration, so
+     * data which arrived while the loop was busy counts as activity before
+     * the sweep decides a connection is idle */
+    ev_set_priority(&timeout_watcher, EV_MINPRI);
 }
 
 /**
@@ -442,13 +454,23 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
         int revents __attribute__((unused))) {
     ev_tstamp now = monotonic_time();
     struct Connection *con = TAILQ_LAST(&connections, ConnectionHead);
+    int closed = 0;
 
     while (con != NULL) {
         /* Fetch the next connection first since con may be freed. Timing out
          * a connection frees only that connection, so prev remains valid. */
         struct Connection *prev = TAILQ_PREV(con, ConnectionHead, entries);
 
-        check_connection_timeout(con, now, loop);
+        closed += check_connection_timeout(con, now, loop);
+
+        if (closed >= TIMEOUT_SWEEP_MAX_CLOSE && prev != NULL) {
+            /* Let the event loop run, and pick up where we left off: the
+             * connections already checked and kept are checked again */
+            ev_timer_stop(loop, w);
+            ev_timer_set(w, TIMEOUT_SWEEP_CONTINUE, TIMEOUT_SWEEP_INTERVAL);
+            ev_timer_start(loop, w);
+            return;
+        }
 
         con = prev;
     }
@@ -458,7 +480,8 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
 }
 
 /*
- * Close and free con if it has exceeded any of its listener's timeouts
+ * Close and free con if it has exceeded any of its listener's timeouts,
+ * returns 1 if it was closed
  *
  * The request timeout limits how long after accepting the connection we may
  * still be waiting for the client's complete request or resolving the
@@ -471,7 +494,7 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
  * The half close timeout limits how long a connection on which one peer has
  * finished may stay idle waiting for the other peer to finish too.
  */
-static void
+static int
 check_connection_timeout(struct Connection *con, ev_tstamp now,
         struct ev_loop *loop) {
     const struct Listener *listener = con->listener;
@@ -511,7 +534,7 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
                 display_sockaddr(&con->client.addr, client, sizeof(client)),
                 listener->half_close_timeout);
     } else {
-        return;
+        return 0;
     }
 
     /* Discard anything still buffered: an expired connection gets no
@@ -519,6 +542,8 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
      * any DNS query in progress, so resolv_cb() will not be called. */
     close_connection(con, loop);
     retire_connection(con);
+
+    return 1;
 }
 
 /*
