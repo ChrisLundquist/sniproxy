@@ -203,7 +203,9 @@ sub expect_closed_within {
 sub expect_open {
     my ($what, $socket) = @_;
 
-    my ($elapsed, $data) = wait_for_close($socket, time, 0);
+    # A socket which was closed earlier is readable at once, so a short wait
+    # suffices; with no wait at all nothing would be checked
+    my ($elapsed, $data) = wait_for_close($socket, time, 1);
     die "$what: unexpectedly closed\n" if defined $elapsed;
     die "$what: unexpected response: $data\n" if length $data;
 }
