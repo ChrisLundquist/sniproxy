@@ -44,6 +44,77 @@ static const char *bad[] = {
         "Accept: */*\r\n"
         "\r\n",
 };
+/* Requests cut off before the Host line is terminated, as can happen when
+ * it is split across TCP segments: these must not yield a (truncated)
+ * hostname, but report an incomplete request so we wait for more data */
+static const char *incomplete[] = {
+    "GET / HTTP/1.1\r\n"
+        "Host",
+    "GET / HTTP/1.1\r\n"
+        "Host:",
+    "GET / HTTP/1.1\r\n"
+        "Host: ",
+    "GET / HTTP/1.1\r\n"
+        "Host: l",
+    "GET / HTTP/1.1\r\n"
+        "Host: local",
+    "GET / HTTP/1.1\r\n"
+        "Host: localhos",
+    "GET / HTTP/1.1\r\n"
+        "Host: localhost",
+    "GET / HTTP/1.1\r\n"
+        "Host: localhost\r",
+    "GET / HTTP/1.1\r\n"
+        "Host: localhost:",
+    "GET / HTTP/1.1\r\n"
+        "Host: localhost:80",
+    "GET / HTTP/1.1\n"
+        "Host: localhost",
+    "GET / HTTP/1.1\r\n"
+        "User-Agent: curl/7.21.0\r\n"
+        "Host: localhost",
+    /* blank line ending the headers is not terminated either */
+    "GET / HTTP/1.1\r\n"
+        "Accept: */*\r\n"
+        "\r",
+};
+
+/*
+ * Feed every prefix of a complete request to the parser: until the Host
+ * line's terminating <LF> has arrived the request must be incomplete, after
+ * that it must yield the full hostname.
+ */
+static void
+test_prefixes(const char *request) {
+    size_t request_len = strlen(request);
+    const char *host = strstr(request, "localhost");
+    assert(host != NULL);
+    const char *host_eol = strchr(host, '\n');
+    assert(host_eol != NULL);
+    size_t complete_len = (size_t)(host_eol - request) + 1;
+
+    for (size_t len = 0; len <= request_len; len++) {
+        /* exact sized copy, so reading past len is caught by ASan/valgrind */
+        char *buf = malloc(len > 0 ? len : 1);
+        assert(buf != NULL);
+        memcpy(buf, request, len);
+
+        char *hostname = NULL;
+        int result = http_protocol->parse_packet(buf, len, &hostname);
+
+        if (len < complete_len) {
+            assert(result == -1);
+            assert(hostname == NULL);
+        } else {
+            assert(result == 9);
+            assert(NULL != hostname);
+            assert(0 == strcmp("localhost", hostname));
+        }
+
+        free(hostname);
+        free(buf);
+    }
+}
 
 int main(void) {
     unsigned int i;
@@ -74,25 +145,18 @@ int main(void) {
         assert(hostname == NULL);
     }
 
-    /* Requests may arrive in pieces: every prefix of a good request must
-     * either be incomplete or yield the complete hostname, never a hostname
-     * cut short (e.g. "loc" from "Host: loc") */
-    for (i = 0; i < sizeof(good) / sizeof(const char *); i++) {
-        for (size_t len = 0; len < strlen(good[i]); len++) {
-            hostname = NULL;
+    for (i = 0; i < sizeof(incomplete) / sizeof(const char *); i++) {
+        hostname = NULL;
 
-            result = http_protocol->parse_packet(good[i], len, &hostname);
+        result = http_protocol->parse_packet(incomplete[i], strlen(incomplete[i]), &hostname);
 
-            if (result == -1) {
-                assert(hostname == NULL);
-            } else {
-                assert(result == 9);
-                assert(hostname != NULL);
-                assert(0 == strcmp("localhost", hostname));
-                free(hostname);
-            }
-        }
+        assert(result == -1);
+
+        assert(hostname == NULL);
     }
+
+    for (i = 0; i < sizeof(good) / sizeof(const char *); i++)
+        test_prefixes(good[i]);
 
     return 0;
 }
