@@ -1,0 +1,244 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$CC" \
+            autotools-dev autoconf automake libtool gettext pkg-config \
+            libev-dev libpcre2-dev libudns-dev curl perl iproute2 iptables \
+            tcpdump valgrind
+
+      - name: Configure
+        run: |
+          ./autogen.sh
+          ./configure --enable-dns
+
+      - name: Build
+        run: make -j"$(nproc)" all CFLAGS=-Werror
+
+      # Runs as the unprivileged runner user, so transparent_proxy_test and
+      # reload_dns_test report SKIP here; the next step runs them as root.
+      - name: Test
+        run: make check CFLAGS=-Werror
+
+      # These skip when the host has no IPv6, but GitHub-hosted runners do.
+      - name: Check the IPv6 tests ran
+        run: |
+          for t in ipv6_v6only_test proxy_header_ipv4_mapped_test; do
+            if ! grep -q '^:test-result: PASS' "tests/$t.trs"; then
+              echo "::error::$t did not pass: $(grep '^:test-result:' "tests/$t.trs")"
+              exit 1
+            fi
+          done
+
+      - name: Test as root
+        working-directory: tests
+        run: |
+          status=0
+          for t in transparent_proxy_test reload_dns_test; do
+            echo "::group::$t"
+            rc=0
+            sudo ./"$t" 2>&1 | tee "root-$t.log" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 77 ]; then
+              echo "::error::$t skipped even though it ran as root"
+              status=1
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error::$t failed (exit status $rc)"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Check for memory errors and leaks (valgrind)
+        if: matrix.cc == 'gcc'
+        working-directory: tests
+        run: |
+          status=0
+          for t in bad_dns_request_test bad_request_test bind_source_test \
+                   connection_reset_test functional_test proxy_header_test \
+                   reload_test slow_client_test; do
+            echo "::group::$t"
+            rc=0
+            ./"$t" valgrind --leak-check=full --error-exitcode=1 \
+              2>&1 | tee "valgrind-$t.log" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$t failed under valgrind (exit status $rc)"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-logs-${{ matrix.cc }}
+          path: |
+            tests/*.log
+            tests/test-suite.log
+          if-no-files-found: ignore
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # GCC, because its sanitizer runtimes are hard dependencies of the
+      # compiler package, unlike clang's.
+      CC: gcc
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$CC" \
+            autotools-dev autoconf automake libtool gettext pkg-config \
+            libev-dev libpcre2-dev libudns-dev curl perl iproute2
+
+      # Older ASan runtimes fail to map their shadow memory under the higher
+      # mmap ASLR entropy of recent kernels.
+      - name: Reduce mmap ASLR entropy for ASan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: |
+          ./autogen.sh
+          ./configure --enable-dns \
+            CFLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            LDFLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: make -j"$(nproc)" all
+
+      - name: Test
+        run: make check
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-logs-sanitizers
+          path: |
+            tests/*.log
+            tests/test-suite.log
+          if-no-files-found: ignore
+
+  no-dns:
+    name: build without DNS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # No libudns-dev, so the build cannot pick it up by accident.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autotools-dev autoconf automake libtool gettext pkg-config \
+            libev-dev libpcre2-dev curl perl iproute2
+
+      - name: Configure
+        run: |
+          ./autogen.sh
+          ./configure
+
+      - name: Build
+        run: make -j"$(nproc)" all CFLAGS=-Werror
+
+      # tests/Makefile.am leaves out the DNS-dependent tests.
+      - name: Test
+        run: make check CFLAGS=-Werror
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-logs-no-dns
+          path: |
+            tests/*.log
+            tests/test-suite.log
+          if-no-files-found: ignore
+
+  # The package jobs run autoreconf rather than autogen.sh: setver.sh would
+  # stamp a version from `git describe`, which does not match AC_INIT
+  # (debian/changelog and the RPM spec would disagree with the tarball).
+  debian-package:
+    name: Debian package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential devscripts debhelper dh-autoreconf cdbs \
+            autotools-dev autoconf automake libtool gettext pkg-config \
+            libev-dev libpcre2-dev libudns-dev
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc
+
+      - name: Install package
+        run: |
+          sudo apt-get install -y ../sniproxy_*_"$(dpkg --print-architecture)".deb
+          sniproxy -V
+
+  rpm-package:
+    name: RPM package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autotools-dev autoconf automake libtool gettext pkg-config \
+            libev-dev libpcre2-dev libudns-dev rpm
+
+      - name: Build source tarball
+        run: |
+          autoreconf --install
+          ./configure --enable-dns
+          make dist
+
+      # --nodeps: the spec's BuildRequires are Fedora package names.
+      - name: Build package
+        run: rpmbuild --define "_sourcedir $PWD" -ba --nodeps redhat/sniproxy.spec
