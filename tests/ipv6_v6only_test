@@ -7,6 +7,7 @@ use lib dirname (__FILE__);
 use TestUtils;
 use TestHTTPD;
 use File::Temp;
+use Socket qw(AF_INET6 SOCK_STREAM);
 
 sub proxy {
     my $config = shift;
@@ -75,6 +76,12 @@ sub main {
     my $workers = $ENV{WORKERS} || 10;
     my $iterations = $ENV{ITERATIONS} || 10;
     my $local_httpd = $ENV{LOCAL_HTTPD_PORT};
+
+    # The listener under test is IPv6, which the host may not support
+    unless (socket(my $probe, AF_INET6, SOCK_STREAM, 0)) {
+        print STDERR "IPv6 is not available: $!\n";
+        exit 77;
+    }
 
     my $config = make_reuseport_config($proxy_port, $local_httpd || $httpd_port);
     my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);

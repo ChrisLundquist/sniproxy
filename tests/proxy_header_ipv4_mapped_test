@@ -1,0 +1,123 @@
+#!/usr/bin/env perl
+
+# An IPv4 client of a dual-stack ([::]) listener is reported by the kernel
+# with IPv4-mapped IPv6 addresses (::ffff:127.0.0.1). The PROXY header sent to
+# the backend should describe the connection as TCP4 with plain IPv4
+# addresses rather than TCP6 with mapped addresses.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+use File::Temp;
+use IO::Socket::INET;
+use Socket qw(AF_INET6 SOCK_STREAM SOL_SOCKET SO_REUSEADDR IPPROTO_IPV6 IPV6_V6ONLY pack_sockaddr_in6 inet_pton);
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+sub worker($$$) {
+    my ($hostname, $port, $requests) = @_;
+
+    for (my $i = 0; $i < $requests; $i++) {
+        system('curl',
+                '-s', '-S',
+                '--fail',
+                '-H', "Host: $hostname",
+                '-o', '/dev/null',
+                "http://127.0.0.1:$port/");
+
+        if ($? == -1) {
+            die "failed to execute: $!\n";
+        } elsif ($? & 127) {
+            printf STDERR "child died with signal %d, %s coredump\n", ($? & 127), ($? & 128) ? 'with' : 'without';
+            exit 255;
+        } elsif ($? >> 8) {
+            exit $? >> 8;
+        }
+    }
+    # Success
+    exit 0;
+}
+
+# Check we can create a dual-stack IPv6 socket on this host
+sub dual_stack_available($) {
+    my $port = shift;
+
+    socket(my $sock, AF_INET6, SOCK_STREAM, 0) or return 0;
+    # Earlier tests leave connections to this port in TIME_WAIT, which makes
+    # bind() fail without SO_REUSEADDR (sniproxy sets it too).
+    setsockopt($sock, SOL_SOCKET, SO_REUSEADDR, 1) or return 0;
+    setsockopt($sock, IPPROTO_IPV6, IPV6_V6ONLY, 0) or return 0;
+    my $result = bind($sock, pack_sockaddr_in6($port, inet_pton(AF_INET6, '::')));
+    close($sock);
+
+    return $result;
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8081;
+    my $iterations = $ENV{ITERATIONS} || 3;
+
+    unless (dual_stack_available($proxy_port)) {
+        print "Dual-stack IPv6 sockets unavailable, skipping\n";
+        exit 77;
+    }
+
+    my ($fh, $config) = File::Temp::tempfile();
+    print $fh <<END;
+listen [::]:$proxy_port {
+    proto http
+    ipv6_v6only off
+}
+
+table {
+    localhost 127.0.0.1:$httpd_port proxy_protocol
+}
+END
+    close($fh);
+
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    my $httpd_pid = start_child('server', \&TestHTTPD::httpd, port => $httpd_port, parser => sub {
+        my $sock = shift;
+        my $status = 500;
+
+        for (my $i = 0; my $line = $sock->getline(); $i++) {
+            if ($i == 0) {
+                if ($line =~ m/\APROXY TCP4 127\.0\.0\.1 127\.0\.0\.1 \d+ $proxy_port\r\n\z/) {
+                    $status = 200;
+                } else {
+                    print STDERR "Unexpected PROXY header: $line";
+                }
+            }
+
+            last if $line eq "\r\n";
+        }
+
+        return $status;
+    });
+
+    wait_for_port(port => $httpd_port);
+    wait_for_port(ip => '127.0.0.1', port => $proxy_port);
+
+    start_child('worker', \&worker, 'localhost', $proxy_port, $iterations);
+    wait_for_type('worker');
+
+    sleep 1;
+
+    kill 15, $proxy_pid;
+    kill 15, $httpd_pid;
+    sleep 1;
+
+    unlink($config);
+
+    reap_children();
+}
+
+main();

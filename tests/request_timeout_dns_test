@@ -1,0 +1,194 @@
+#!/usr/bin/env perl
+
+# Verify the request timeout applies while resolving the server's address and
+# cancels the DNS query: a name server which never answers is used so the
+# lookup is still in progress when the timeout expires. The proxy is kept
+# running until after the resolver would have given up on the query, so a
+# query which was not cancelled would call back for a freed connection
+# (caught when built with -fsanitize=address).
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use File::Temp;
+use IO::Select;
+use IO::Socket::INET;
+use Time::HiRes qw(time sleep);
+
+use constant REQUEST_TIMEOUT => 2;
+# Resolver timeout, the time the resolver waits before failing a query
+use constant DNS_TIMEOUT => 5;
+
+sub proxy {
+    my $config = shift;
+    my $dns_port = shift;
+
+    # Make udns ask our name server, once, and wait DNS_TIMEOUT for it. Ask
+    # for the name as given first, without the host's search domains (such
+    # as a Kubernetes pod's, with ndots:5), which would delay that query.
+    $ENV{'NAMESERVERS'} = '127.0.0.1';
+    $ENV{'RES_OPTIONS'} = "port:$dns_port timeout:${\ DNS_TIMEOUT} attempts:1 ndots:1";
+    $ENV{'LOCALDOMAIN'} = '';
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Name server which logs the name in each query it receives and never answers
+sub silent_name_server {
+    my ($port, $log) = @_;
+
+    my $socket = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       Proto => 'udp')
+        or die "bind: $!";
+
+    open(my $fh, '>>', $log) or die "open: $!";
+    $fh->autoflush(1);
+
+    while (defined $socket->recv(my $packet, 512)) {
+        # Question name follows the 12 byte header as length prefixed labels
+        my @labels;
+        for (my $i = 12; $i < length $packet; ) {
+            my $len = ord(substr($packet, $i, 1));
+            last if $len == 0 || $len > 63;
+            push @labels, substr($packet, $i + 1, $len);
+            $i += $len + 1;
+        }
+        print $fh join('.', @labels), "\n";
+    }
+    die "recv: $!";
+}
+
+sub make_dns_config {
+    my ($timeout_port, $control_port) = @_;
+
+    my ($fh, $filename) = File::Temp::tempfile();
+
+    print $fh <<END;
+# Request timeout while resolving test configuration
+
+listen 127.0.0.1 $timeout_port {
+    proto http
+    request_timeout ${\ REQUEST_TIMEOUT}
+}
+
+listen 127.0.0.1 $control_port {
+    proto http
+    request_timeout 0
+}
+
+table {
+    .* *:80
+}
+END
+
+    close($fh);
+
+    return $filename;
+}
+
+# Send a request for $hostname and return the response, if any, and the
+# seconds until the proxy closed the connection
+sub request {
+    my ($what, $port, $hostname) = @_;
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Type => SOCK_STREAM,
+                                       Timeout => 5)
+        or die "$what: couldn't connect to $port: $!\n";
+    my $start = time;
+
+    syswrite($socket, "GET / HTTP/1.1\r\nHost: $hostname\r\n\r\n")
+        or die "$what: write failed: $!\n";
+
+    my $select = IO::Select->new($socket);
+    my $response = '';
+    while ($select->can_read(DNS_TIMEOUT + 5)) {
+        my $bytes = sysread($socket, my $buffer, 4096);
+        return ($response, time - $start) unless $bytes;
+        $response .= $buffer;
+    }
+
+    die "$what: not disconnected\n";
+}
+
+sub timeout_client {
+    my $port = shift;
+    my $what = 'client timed out while resolving';
+
+    my ($response, $elapsed) = request($what, $port, 'timeout.example');
+
+    die "$what: unexpected response: $response\n" if length $response;
+    die sprintf("%s: disconnected after %.2f seconds, expected about %d\n",
+                $what, $elapsed, REQUEST_TIMEOUT)
+        if $elapsed < REQUEST_TIMEOUT - 0.5 || $elapsed > REQUEST_TIMEOUT + 2.5;
+
+    exit 0;
+}
+
+# Without the request timeout we wait for the resolver to fail
+sub control_client {
+    my $port = shift;
+    my $what = 'client without request timeout';
+
+    my ($response, $elapsed) = request($what, $port, 'control.example');
+
+    die "$what: unexpected response: $response\n"
+        unless $response =~ /\AHTTP\/1\.1 503 /;
+    die sprintf("%s: resolver failed after %.2f seconds, expected about %d\n",
+                $what, $elapsed, DNS_TIMEOUT)
+        if $elapsed < DNS_TIMEOUT - 0.5;
+
+    exit 0;
+}
+
+sub main {
+    my $timeout_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $control_port = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $dns_port = $ENV{TEST_DNS_PORT} || 8053;
+
+    my ($log_fh, $dns_log) = File::Temp::tempfile();
+    close($log_fh);
+
+    my $config = make_dns_config($timeout_port, $control_port);
+    start_child('server', \&silent_name_server, $dns_port, $dns_log);
+    my $proxy_pid = start_child('server', \&proxy, $config, $dns_port, @ARGV);
+
+    wait_for_port(port => $timeout_port);
+    wait_for_port(port => $control_port);
+
+    start_child('worker', \&timeout_client, $timeout_port);
+    start_child('worker', \&control_client, $control_port);
+    wait_for_type('worker');
+
+    # Both queries have now outlived the resolver's timeout, give the proxy a
+    # moment to have processed it
+    sleep 1;
+
+    my $failed = !eval {
+        open(my $fh, '<', $dns_log) or die "open: $!\n";
+        my @queried = map { chomp; $_ } <$fh>;
+        close($fh);
+
+        # Otherwise the timeout did not happen while resolving
+        die "no DNS query received for timeout.example\n"
+            unless grep { /\Atimeout\.example(\.|\z)/ } @queried;
+        1;
+    };
+    print "Test failed: $@" if $failed;
+
+    kill 15, $proxy_pid;
+    sleep 1;
+
+    unlink($config);
+    unlink($dns_log);
+
+    reap_children();
+    exit($failed ? 1 : 0);
+}
+
+main();

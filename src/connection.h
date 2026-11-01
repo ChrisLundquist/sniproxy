@@ -39,9 +39,9 @@ struct Connection {
         PARSED,         /* Parsed initial request and extracted hostname */
         RESOLVING,      /* DNS query in progress */
         RESOLVED,       /* Server socket address resolved */
-        CONNECTED,      /* Connected to server */
-        SERVER_CLOSED,  /* Client closed socket */
-        CLIENT_CLOSED,  /* Server closed socket */
+        CONNECTED,      /* Connected to server, either side may be half-closed */
+        SERVER_CLOSED,  /* Server socket closed, flushing to client */
+        CLIENT_CLOSED,  /* Client socket closed, flushing to server */
         CLOSED          /* Both sockets closed */
     } state;
 
@@ -50,13 +50,20 @@ struct Connection {
         socklen_t addr_len, local_addr_len;
         struct ev_io watcher;
         struct Buffer *buffer;
+        int eof;        /* Peer shut down its sending side: no more input */
+        int shut_wr;    /* We called shutdown(SHUT_WR) toward this peer */
     } client, server;
     struct Listener *listener;
     const char *hostname; /* Requested hostname */
     size_t hostname_len;
     size_t header_len;
     struct ResolvQuery *query_handle;
-    ev_tstamp established_timestamp;
+    ev_tstamp established_timestamp; /* wall clock (ev_now()), for reporting */
+    /* monotonic_time() when the connection was accepted, and when we started
+     * connecting to the server: timeouts are measured on this clock so that
+     * stepping the wall clock doesn't trigger or suspend them */
+    ev_tstamp accepted_monotonic;
+    ev_tstamp connect_monotonic;
     int use_proxy_header;
 
     TAILQ_ENTRY(Connection) entries;

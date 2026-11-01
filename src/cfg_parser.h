@@ -34,6 +34,9 @@ struct Keyword {
     int (*const parse_arg)(void *, const char *);
     const struct Keyword *const block_grammar;
     int (*const finalize)(void *, void *);
+    /* Frees what create() returned, when parsing fails before finalize()
+     * takes it over (finalize() must free it itself if it fails) */
+    void (*const free)(void *);
 };
 
 

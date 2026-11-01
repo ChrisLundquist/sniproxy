@@ -132,7 +132,7 @@ struct LookupResult
 table_lookup_server_address(const struct Table *table, const char *name, size_t name_len) {
     struct Backend *b = table_lookup_backend(table, name, name_len);
     if (b == NULL) {
-        info("No match found for %.*s", (int)name_len, name);
+        info("No match found for %.*s", (int)name_len, name ? name : "");
         return (struct LookupResult){.address = NULL};
     }
 
@@ -176,6 +176,10 @@ reload_tables(struct Table_head *tables, struct Table_head *new_tables) {
             struct Backend_head temp = existing->backends;
             existing->backends = iter->backends;
             iter->backends = temp;
+            /* use_proxy_header summarizes the backends, so it moves with
+             * them: accept_connection() relies on it to decide whether to
+             * prepend the PROXY header */
+            existing->use_proxy_header = iter->use_proxy_header;
         } else {
             add_table(tables, iter);
         }

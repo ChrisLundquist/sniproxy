@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h> /* INT_MAX */
 #include <assert.h>
 #include <sys/queue.h>
 #include <sys/types.h>
@@ -48,11 +49,19 @@
 #include "tls.h"
 #include "http.h"
 
+/*
+ * Seconds a client may take to send a complete request (including resolving
+ * the server's address) unless the listener configures otherwise
+ */
+#define DEFAULT_REQUEST_TIMEOUT 30
+#define DEFAULT_HALF_CLOSE_TIMEOUT 60
+
 static void close_listener(struct ev_loop *, struct Listener *);
 static void accept_cb(struct ev_loop *, struct ev_io *, int);
 static void backoff_timer_cb(struct ev_loop *, struct ev_timer *, int);
 static int init_listener(struct Listener *, const struct Table_head *, struct ev_loop *);
 static void listener_update(struct Listener *, struct Listener *,  const struct Table_head *);
+static void inherit_fallback_port(struct Listener *);
 static void free_listener(struct Listener *);
 static int parse_boolean(const char *);
 
@@ -171,10 +180,24 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
     free(existing_listener->fallback_address);
     existing_listener->fallback_address = new_listener->fallback_address;
     new_listener->fallback_address = NULL;
+    existing_listener->fallback_use_proxy_header =
+        new_listener->fallback_use_proxy_header;
+    /* new_listener was never initialized, so apply the same defaults
+     * init_listener() would have */
+    inherit_fallback_port(existing_listener);
 
     free(existing_listener->source_address);
     existing_listener->source_address = new_listener->source_address;
     new_listener->source_address = NULL;
+    existing_listener->transparent_proxy = new_listener->transparent_proxy;
+
+    if (existing_listener->reuseport != new_listener->reuseport ||
+            existing_listener->ipv6_v6only != new_listener->ipv6_v6only) {
+        char address[ADDRESS_BUFFER_SIZE];
+        warn("Listener %s: changes to reuseport or ipv6_v6only require a restart",
+                display_address(existing_listener->address,
+                    address, sizeof(address)));
+    }
 
     existing_listener->protocol = new_listener->protocol;
 
@@ -187,6 +210,12 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
 
     existing_listener->log_bad_requests = new_listener->log_bad_requests;
 
+    /* Timeouts are read from the listener on every sweep, so these also
+     * apply to connections accepted before the reload */
+    existing_listener->request_timeout = new_listener->request_timeout;
+    existing_listener->idle_timeout = new_listener->idle_timeout;
+    existing_listener->half_close_timeout = new_listener->half_close_timeout;
+
     struct Table *new_table =
             table_lookup(tables, existing_listener->table_name);
 
@@ -198,7 +227,25 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
 
         table_ref_put(new_listener->table);
         new_listener->table = NULL;
+    } else {
+        char address[ADDRESS_BUFFER_SIZE];
+        err("Table \"%s\" not defined, listener %s continues using its previous table",
+                existing_listener->table_name,
+                display_address(existing_listener->address,
+                    address, sizeof(address)));
     }
+}
+
+/*
+ * If no port was specified on the fallback address, inherit the port from the
+ * listening address
+ */
+static void
+inherit_fallback_port(struct Listener *listener) {
+    if (listener->fallback_address &&
+            address_port(listener->fallback_address) == 0)
+        address_set_port(listener->fallback_address,
+                address_port(listener->address));
 }
 
 struct Listener *
@@ -220,6 +267,9 @@ new_listener(void) {
     listener->ipv6_v6only = 0;
     listener->transparent_proxy = 0;
     listener->fallback_use_proxy_header = 0;
+    listener->request_timeout = DEFAULT_REQUEST_TIMEOUT;
+    listener->idle_timeout = 0;
+    listener->half_close_timeout = DEFAULT_HALF_CLOSE_TIMEOUT;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
      * are not active */
@@ -259,6 +309,7 @@ accept_listener_arg(struct Listener *listener, const char *arg) {
         }
     } else {
         err("Invalid listener argument %s", arg);
+        return -1;
     }
 
     return 1;
@@ -281,12 +332,21 @@ accept_listener_table_name(struct Listener *listener, const char *table_name) {
 
 int
 accept_listener_protocol(struct Listener *listener, const char *protocol) {
-    if (strncasecmp(protocol, http_protocol->name, strlen(protocol)) == 0)
+    if (*protocol != '\0' &&
+            strncasecmp(protocol, http_protocol->name, strlen(protocol)) == 0) {
         listener->protocol = http_protocol;
-    else
+    } else if (strcasecmp(protocol, tls_protocol->name) == 0 ||
+            strcasecmp(protocol, "ssl") == 0 ||
+            strcasecmp(protocol, "https") == 0) {
         listener->protocol = tls_protocol;
+    } else {
+        err("Unknown protocol %s, expected http or tls", protocol);
+        return -1;
+    }
 
-    if (address_port(listener->address) == 0)
+    /* The listener address is normally given before the block, but may be
+     * missing in an invalid configuration (rejected by valid_listener()) */
+    if (listener->address != NULL && address_port(listener->address) == 0)
         address_set_port(listener->address, listener->protocol->default_port);
 
     return 1;
@@ -338,7 +398,7 @@ accept_listener_fallback_address(struct Listener *listener, const char *fallback
             return 1;
         } else if (address_is_hostname(fallback_address)) {
 #ifndef HAVE_LIBUDNS
-            err("Only fallback socket addresses permitted when compiled without libudns");
+            err("Hostname fallback addresses require DNS support, which this build of sniproxy lacks (configure with --enable-dns and libudns): %s", fallback);
             free(fallback_address);
             return 0;
 #else
@@ -358,8 +418,10 @@ accept_listener_fallback_address(struct Listener *listener, const char *fallback
             fatal("Unexpected fallback address type");
             return 0;
         }
-    } else if (strcasecmp("proxy", fallback) == 0 &&
+    } else if ((strcasecmp("proxy", fallback) == 0 ||
+                strcasecmp("proxy_protocol", fallback) == 0) &&
             listener->fallback_use_proxy_header == 0) {
+        /* "proxy_protocol" matches the table backend option name */
         listener->fallback_use_proxy_header = 1;
         return 1;
     } else {
@@ -408,8 +470,63 @@ accept_listener_source_address(struct Listener *listener, const char *source) {
 
 int
 accept_listener_bad_request_action(struct Listener *listener, const char *action) {
-    if (strncmp("log", action, strlen(action)) == 0) {
+    if (*action != '\0' && strncmp("log", action, strlen(action)) == 0) {
         listener->log_bad_requests = 1;
+    } else {
+        err("Unknown bad_requests action %s, expected log", action);
+        return -1;
+    }
+
+    return 1;
+}
+
+/*
+ * Parse a non-negative whole number of seconds
+ *
+ * Returns 1 on success or 0 if arg is not a valid timeout.
+ */
+static int
+parse_timeout(const char *arg, int *timeout) {
+    char *end;
+
+    errno = 0;
+    long value = strtol(arg, &end, 10);
+    if (errno != 0 || end == arg || *end != '\0' ||
+            value < 0 || value > INT_MAX)
+        return 0;
+
+    *timeout = (int)value;
+    return 1;
+}
+
+int
+accept_listener_request_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->request_timeout)) {
+        err("Invalid request_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
+        return -1;
+    }
+
+    return 1;
+}
+
+int
+accept_listener_idle_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->idle_timeout)) {
+        err("Invalid idle_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
+        return -1;
+    }
+
+    return 1;
+}
+
+int
+accept_listener_half_close_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->half_close_timeout)) {
+        err("Invalid half_close_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
+        return -1;
     }
 
     return 1;
@@ -501,12 +618,7 @@ init_listener(struct Listener *listener, const struct Table_head *tables,
     init_table(table);
     listener->table = table_ref_get(table);
 
-    /* If no port was specified on the fallback address, inherit the address
-     * from the listening address */
-    if (listener->fallback_address &&
-            address_port(listener->fallback_address) == 0)
-        address_set_port(listener->fallback_address,
-                address_port(listener->address));
+    inherit_fallback_port(listener);
 
 #ifdef HAVE_ACCEPT4
     int sockfd = socket(address_sa(listener->address)->sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -709,6 +821,10 @@ print_listener_config(FILE *file, const struct Listener *listener) {
 
     if (listener->reuseport)
         fprintf(file, "\treuseport on\n");
+
+    fprintf(file, "\trequest_timeout %d\n", listener->request_timeout);
+    fprintf(file, "\tidle_timeout %d\n", listener->idle_timeout);
+    fprintf(file, "\thalf_close_timeout %d\n", listener->half_close_timeout);
 
     fprintf(file, "}\n\n");
 }

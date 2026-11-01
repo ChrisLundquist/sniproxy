@@ -28,6 +28,7 @@
 
 #include <stdio.h>
 #include <sys/types.h>
+#include <time.h>
 #include <ev.h>
 
 
@@ -36,8 +37,9 @@ struct Buffer {
     size_t size_mask;       /* bit mask for buffer size */
     size_t head;            /* index of first byte of content */
     size_t len;             /* size of content */
-    ev_tstamp last_recv;
+    ev_tstamp last_recv;    /* wall clock (ev_now()), for reporting */
     ev_tstamp last_send;
+    ev_tstamp last_activity; /* monotonic_time() of the last recv or send */
     size_t tx_bytes;
     size_t rx_bytes;
 };
@@ -54,6 +56,18 @@ size_t buffer_peek(const struct Buffer *, void *, size_t);
 size_t buffer_coalesce(struct Buffer *, const void **);
 size_t buffer_pop(struct Buffer *, void *, size_t);
 size_t buffer_push(struct Buffer *, const void *, size_t);
+/*
+ * Seconds on a clock which, unlike the wall clock behind ev_now(), is never
+ * stepped: use it to measure elapsed time, such as timeouts, and ev_now() for
+ * times which are reported.
+ */
+static inline ev_tstamp monotonic_time(void) {
+    struct timespec ts = { 0, 0 };
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (ev_tstamp)ts.tv_sec + (ev_tstamp)ts.tv_nsec * 1e-9;
+}
 static inline size_t buffer_size(const struct Buffer *b) {
     return b->size_mask + 1;
 }

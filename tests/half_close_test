@@ -1,0 +1,330 @@
+#!/usr/bin/env perl
+
+# Verify TCP half-close is relayed in both directions:
+#  - the client sends a request and shuts down its sending side, it must still
+#    receive the complete response;
+#  - the server sends its response and shuts down its sending side, it must
+#    still receive data the client sends after seeing the end of the response.
+# And that half-closes before the server connection exists are handled:
+#  - a client which shuts down after an incomplete request gets the abort
+#    message (HTTP 503) rather than hanging;
+#  - a client which shuts down without sending anything, including on a
+#    listener which prepends a PROXY header, is closed cleanly.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+use File::Temp;
+use IO::Socket::INET;
+use Socket;
+
+my $server_shutdown_response = "HTTP/1.1 200 OK\r\n" .
+                               "Content-Type: text/plain\r\n" .
+                               "Content-Length: 6\r\n" .
+                               "\r\n" .
+                               "hello\n";
+my $client_trailer = "sent after the server shut down\n" x 64;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+# Read from socket until end of stream
+sub read_all($) {
+    my $socket = shift;
+    my $data = '';
+
+    while (1) {
+        my $bytes = sysread($socket, my $chunk, 65536);
+        die "read: $!\n" unless defined $bytes;
+        last if $bytes == 0;
+        $data .= $chunk;
+    }
+
+    return $data;
+}
+
+sub connect_proxy($) {
+    my $port = shift;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Type => SOCK_STREAM)
+        or die "couldn't connect: $!\n";
+
+    return $socket;
+}
+
+# Client shuts down its sending side right after the request, TestHTTPD only
+# responds after reading the whole request
+sub client_shutdown_worker($$) {
+    my ($port, $requests) = @_;
+
+    local $SIG{ALRM} = sub { die "timed out waiting for response\n" };
+
+    for (my $i = 0; $i < $requests; $i++) {
+        alarm 10;
+
+        my $socket = connect_proxy($port);
+
+        syswrite($socket, "GET / HTTP/1.1\r\n" .
+                          "Host: localhost\r\n" .
+                          "User-Agent: half_close_test/0.1\r\n" .
+                          "\r\n")
+            or die "write: $!\n";
+
+        # Done sending, but we still expect the complete response
+        shutdown($socket, 1) or die "shutdown: $!\n";
+
+        my $response = read_all($socket);
+        close($socket);
+        alarm 0;
+
+        my ($headers, $body) = split(/\r\n\r\n/, $response, 2);
+        die "Unexpected response (" . length($response) . " bytes)\n"
+            unless defined $body && $headers =~ /\AHTTP\/1\.1 200 OK\r\n/;
+
+        my ($content_length) = $headers =~ /^Content-Length: (\d+)\r?$/mi;
+        die "Response without Content-Length\n" unless defined $content_length;
+        die "Truncated response: " . length($body) .
+            " of $content_length body bytes\n"
+            unless length($body) == $content_length;
+    }
+
+    exit 0;
+}
+
+# Backend which sends its response and shuts down its sending side, then reads
+# the rest of the client's data until end of stream. Exits successfully once
+# it has received the expected trailer on each of the requested connections.
+sub server_shutdown_backend($$) {
+    my ($port, $requests) = @_;
+
+    my $server = IO::Socket::INET->new(Listen => SOMAXCONN,
+                                       Proto => 'tcp',
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       ReuseAddr => 1)
+        or die "listen: $!\n";
+
+    local $SIG{ALRM} = sub { die "backend timed out\n" };
+    alarm 30;
+
+    my $handled = 0;
+    while ($handled < $requests) {
+        my $client = $server->accept() or die "accept: $!\n";
+
+        my $data = '';
+        until ($data =~ /\r\n\r\n/) {
+            my $bytes = sysread($client, my $chunk, 4096);
+            die "read: $!\n" unless defined $bytes;
+            last if $bytes == 0;
+            $data .= $chunk;
+        }
+
+        # Skip connections without a request, e.g. from wait_for_port()
+        unless ($data =~ s/\A.*?\r\n\r\n//s) {
+            close($client);
+            next;
+        }
+
+        syswrite($client, $server_shutdown_response) or die "write: $!\n";
+        shutdown($client, 1) or die "shutdown: $!\n";
+
+        # The client sends its trailer after seeing our end of stream
+        $data .= read_all($client);
+        close($client);
+
+        die "Backend received " . length($data) . " bytes after the " .
+            "request, expected " . length($client_trailer) . "\n"
+            unless $data eq $client_trailer;
+
+        $handled++;
+    }
+
+    exit 0;
+}
+
+sub server_shutdown_worker($$) {
+    my ($port, $requests) = @_;
+
+    local $SIG{ALRM} = sub { die "timed out waiting for response\n" };
+
+    for (my $i = 0; $i < $requests; $i++) {
+        alarm 10;
+
+        my $socket = connect_proxy($port);
+
+        syswrite($socket, "GET / HTTP/1.1\r\n" .
+                          "Host: server-shutdown.test\r\n" .
+                          "User-Agent: half_close_test/0.1\r\n" .
+                          "\r\n")
+            or die "write: $!\n";
+
+        # Backend shuts down its sending side after the response...
+        my $response = read_all($socket);
+        die "Unexpected response (" . length($response) . " bytes)\n"
+            unless $response eq $server_shutdown_response;
+
+        # ...but is still reading, the backend checks it received this
+        syswrite($socket, $client_trailer) or die "write: $!\n";
+        shutdown($socket, 1) or die "shutdown: $!\n";
+        close($socket);
+        alarm 0;
+    }
+
+    exit 0;
+}
+
+# Client sends part of a request, then shuts down its sending side: sniproxy
+# can't route it and should answer with the abort message, then close
+sub incomplete_request_worker($$) {
+    my ($port, $requests) = @_;
+
+    local $SIG{ALRM} = sub { die "timed out waiting for abort message\n" };
+
+    for (my $i = 0; $i < $requests; $i++) {
+        alarm 10;
+
+        my $socket = connect_proxy($port);
+        # No complete header line yet, so the request is incomplete for any
+        # parser: only the end of stream decides what happens to it
+        syswrite($socket, "GET / HTTP/1.1\r\nUser-Agent: half_close_te") or die "write: $!\n";
+        shutdown($socket, 1) or die "shutdown: $!\n";
+
+        my $response = read_all($socket);
+        close($socket);
+        alarm 0;
+
+        die "Unexpected response to incomplete request: " .
+            substr($response, 0, 64) . "\n"
+            unless $response =~ /\AHTTP\/1\.1 503 /;
+    }
+
+    exit 0;
+}
+
+# Client connects and shuts down its sending side without sending anything:
+# sniproxy should close the connection
+sub no_request_worker($$) {
+    my ($port, $requests) = @_;
+
+    local $SIG{ALRM} = sub { die "timed out waiting for close\n" };
+
+    for (my $i = 0; $i < $requests; $i++) {
+        alarm 10;
+
+        my $socket = connect_proxy($port);
+        shutdown($socket, 1) or die "shutdown: $!\n";
+
+        my $response = read_all($socket);
+        close($socket);
+        alarm 0;
+
+        die "Unexpected response without a request: " .
+            substr($response, 0, 64) . "\n"
+            unless $response eq '';
+    }
+
+    exit 0;
+}
+
+sub make_half_close_config($$$$) {
+    my ($proxy_port, $proxy_header_port, $httpd_port, $backend_port) = @_;
+
+    my ($fh, $filename) = File::Temp::tempfile();
+    my ($unused, $logfile) = File::Temp::tempfile();
+
+    # Write out a test config file
+    print $fh <<END;
+# Minimal test configuration
+
+listen 127.0.0.1 $proxy_port {
+    proto http
+
+    access_log $logfile
+}
+
+# Prepends a PROXY header for any backend
+listen 127.0.0.1 $proxy_header_port {
+    proto http
+    table proxy_header
+    access_log $logfile
+}
+
+table {
+    localhost 127.0.0.1 $httpd_port
+    server-shutdown.test 127.0.0.1 $backend_port
+}
+
+table proxy_header {
+    localhost 127.0.0.1 $httpd_port proxy_protocol
+}
+END
+
+    close ($fh);
+
+    return ($filename, $logfile);
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8081;
+    my $backend_port = $ENV{TEST_BACKEND_PORT} || 8082;
+    my $proxy_header_port = $ENV{SNI_PROXY_PORT2} || 8083;
+    my $workers = $ENV{WORKERS} || 3;
+    my $iterations = $ENV{ITERATIONS} || 10;
+
+    my ($config, $logfile) =
+        make_half_close_config($proxy_port, $proxy_header_port, $httpd_port, $backend_port);
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    my $httpd_pid = start_child('server', \&TestHTTPD::httpd, port => $httpd_port);
+    start_child('server-shutdown-backend', \&server_shutdown_backend,
+                $backend_port, $iterations);
+
+    # Wait for proxy to load and parse config
+    wait_for_port(port => $httpd_port);
+    wait_for_port(port => $backend_port);
+    wait_for_port(port => $proxy_port);
+    wait_for_port(port => $proxy_header_port);
+
+    for (my $i = 0; $i < $workers; $i++) {
+        start_child('client-shutdown-worker', \&client_shutdown_worker,
+                    $proxy_port, $iterations);
+    }
+    start_child('server-shutdown-worker', \&server_shutdown_worker,
+                $proxy_port, $iterations);
+    start_child('incomplete-request-worker', \&incomplete_request_worker,
+                $proxy_port, $iterations);
+    start_child('no-request-worker', \&no_request_worker,
+                $proxy_port, $iterations);
+    start_child('no-request-worker', \&no_request_worker,
+                $proxy_header_port, $iterations);
+
+    # Wait for all our children to finish
+    wait_for_type('client-shutdown-worker');
+    wait_for_type('server-shutdown-worker');
+    wait_for_type('server-shutdown-backend');
+    wait_for_type('incomplete-request-worker');
+    wait_for_type('no-request-worker');
+
+    # Orderly shutdown of the server
+    kill 15, $proxy_pid;
+    kill 15, $httpd_pid;
+    sleep 1;
+
+    # Delete our test configuration
+    unlink($config);
+    unlink($logfile);
+
+    # Kill off any remaining children
+    reap_children();
+}
+
+main();

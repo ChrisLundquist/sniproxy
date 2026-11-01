@@ -51,6 +51,29 @@
                                       _errno == EINTR)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+/* Initial size of client and server buffers, must be a power of 2 */
+#define BUFFER_SIZE 4096
+/*
+ * Largest the client buffer may grow to while waiting for a complete request,
+ * a power of 2 large enough for a maximum size TLS record (16 KiB + 5 byte
+ * header) with a PROXY header prepended.
+ */
+#define MAX_REQUEST_BUFFER_SIZE 32768
+/*
+ * Seconds between sweeps for connections exceeding their listener's request
+ * or idle timeout. Timeouts are configured in whole seconds, so a connection
+ * is closed at most this long after its deadline.
+ */
+#define TIMEOUT_SWEEP_INTERVAL 1.0
+/*
+ * Most connections a sweep closes before letting the event loop run again:
+ * many connections can expire at once, e.g. a burst of clients which never
+ * send their request, and closing them all in one go would stall the other
+ * connections. The sweep continues after TIMEOUT_SWEEP_CONTINUE seconds.
+ */
+#define TIMEOUT_SWEEP_MAX_CLOSE 256
+#define TIMEOUT_SWEEP_CONTINUE 0.01
+
 
 struct resolv_cb_data {
     struct Connection *connection;
@@ -61,16 +84,22 @@ struct resolv_cb_data {
 
 
 static TAILQ_HEAD(ConnectionHead, Connection) connections;
+/* One timer shared by all connections, active while any exist */
+static struct ev_timer timeout_watcher;
 
 
 static inline int client_socket_open(const struct Connection *);
 static inline int server_socket_open(const struct Connection *);
+static inline int server_connect_pending(const struct Connection *);
+static inline int connection_half_closed(const struct Connection *);
 
 static void reactivate_watcher(struct ev_loop *, struct ev_io *,
-        const struct Buffer *, const struct Buffer *);
+        const struct Buffer *, int, const struct Buffer *);
 
 static void connection_cb(struct ev_loop *, struct ev_io *, int);
 static void resolv_cb(struct Address *, void *);
+static void update_connection(struct Connection *, struct ev_loop *);
+static void relay_shutdowns(struct Connection *, struct ev_loop *);
 static void reactivate_watchers(struct Connection *, struct ev_loop *);
 static void insert_proxy_v1_header(struct Connection *);
 static void parse_client_request(struct Connection *);
@@ -80,6 +109,11 @@ static void close_connection(struct Connection *, struct ev_loop *);
 static void close_client_socket(struct Connection *, struct ev_loop *);
 static void abort_connection(struct Connection *);
 static void close_server_socket(struct Connection *, struct ev_loop *);
+static void timeout_cb(struct ev_loop *, struct ev_timer *, int);
+static int check_connection_timeout(struct Connection *, ev_tstamp,
+        struct ev_loop *);
+static ev_tstamp connection_last_activity(const struct Connection *);
+static void retire_connection(struct Connection *);
 static struct Connection *new_connection(struct ev_loop *);
 static void log_connection(struct Connection *);
 static void log_bad_request(struct Connection *, const char *, size_t, int);
@@ -91,6 +125,12 @@ static void free_resolv_cb_data(struct resolv_cb_data *);
 void
 init_connections(void) {
     TAILQ_INIT(&connections);
+    ev_timer_init(&timeout_watcher, timeout_cb,
+            TIMEOUT_SWEEP_INTERVAL, TIMEOUT_SWEEP_INTERVAL);
+    /* Run after the I/O callbacks pending in the same loop iteration, so
+     * data which arrived while the loop was busy counts as activity before
+     * the sweep decides a connection is idle */
+    ev_set_priority(&timeout_watcher, EV_MINPRI);
 }
 
 /**
@@ -149,10 +189,15 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
     con->client.watcher.data = con;
     con->state = ACCEPTED;
     con->established_timestamp = ev_now(loop);
+    con->accepted_monotonic = monotonic_time();
 
     TAILQ_INSERT_HEAD(&connections, con, entries);
 
     ev_io_start(loop, client_watcher);
+
+    /* The sweep stops itself once no connections remain */
+    if (!ev_is_active(&timeout_watcher))
+        ev_timer_again(loop, &timeout_watcher);
 
     if (con->listener->table->use_proxy_header ||
             con->listener->fallback_use_proxy_header)
@@ -166,6 +211,8 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
  */
 void
 free_connections(struct ev_loop *loop) {
+    ev_timer_stop(loop, &timeout_watcher);
+
     struct Connection *iter;
     while ((iter = TAILQ_FIRST(&connections)) != NULL) {
         TAILQ_REMOVE(&connections, iter, entries);
@@ -206,6 +253,7 @@ print_connections(void) {
  * Test is client socket is open
  *
  * Returns true iff the client socket is opened based on connection state.
+ * An open socket may be half-closed, see client.eof and client.shut_wr.
  */
 static inline int
 client_socket_open(const struct Connection *con) {
@@ -221,10 +269,42 @@ client_socket_open(const struct Connection *con) {
  * Test is server socket is open
  *
  * Returns true iff the server socket is opened based on connection state.
+ * An open socket may be half-closed, see server.eof and server.shut_wr.
  */
 static inline int
 server_socket_open(const struct Connection *con) {
     return con->state == CONNECTED ||
+        con->state == CLIENT_CLOSED;
+}
+
+/*
+ * Test if we have yet to start connecting to the server
+ *
+ * Returns true iff we are still waiting for the client's request or for the
+ * server's address to be resolved. The request timeout applies to these.
+ */
+static inline int
+server_connect_pending(const struct Connection *con) {
+    return con->state == ACCEPTED ||
+        con->state == PARSED ||
+        con->state == RESOLVING ||
+        con->state == RESOLVED;
+}
+
+/*
+ * Test if either side of the connection has finished
+ *
+ * Returns true iff one peer has shut down its sending side or closed its
+ * socket while we are still relaying to or from the other, the case the half
+ * close timeout applies to. Before the server connection is established
+ * connections are covered by the request timeout instead, except once an
+ * abort message is being flushed to the client.
+ */
+static inline int
+connection_half_closed(const struct Connection *con) {
+    return (con->state == CONNECTED &&
+            (con->client.eof || con->server.eof)) ||
+        con->state == SERVER_CLOSED ||
         con->state == CLIENT_CLOSED;
 }
 
@@ -247,11 +327,12 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
         is_client ? con->client.buffer : con->server.buffer;
     struct Buffer *output_buffer =
         is_client ? con->server.buffer : con->client.buffer;
+    int *input_eof = is_client ? &con->client.eof : &con->server.eof;
     void (*close_socket)(struct Connection *, struct ev_loop *) =
         is_client ? close_client_socket : close_server_socket;
 
     /* Receive first in case the socket was closed */
-    if (revents & EV_READ && buffer_room(input_buffer)) {
+    if (revents & EV_READ && !*input_eof && buffer_room(input_buffer)) {
         ssize_t bytes_received = buffer_recv(input_buffer, w->fd, 0, loop);
         if (bytes_received < 0 && !IS_TEMPORARY_SOCKERR(errno)) {
             warn("recv(%s): %s, closing connection",
@@ -260,9 +341,10 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
 
             close_socket(con, loop);
             revents = 0; /* Clear revents so we don't try to send */
-        } else if (bytes_received == 0) { /* peer closed socket */
-            close_socket(con, loop);
-            revents = 0;
+        } else if (bytes_received == 0) {
+            /* Peer shut down its sending side, but it may still be
+             * reading: keep relaying data to it, see relay_shutdowns() */
+            *input_eof = 1;
         }
     }
 
@@ -280,12 +362,31 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
 
     /* Handle any state specific logic, note we may transition through several
      * states during a single call */
-    if (is_client && con->state == ACCEPTED)
-        parse_client_request(con);
+    if (is_client && con->state == ACCEPTED) {
+        /* Anything beyond a PROXY header we prepended came from the client */
+        if (con->client.eof &&
+                buffer_len(con->client.buffer) <= con->header_len)
+            close_client_socket(con, loop); /* closed without a request */
+        else
+            parse_client_request(con);
+    }
     if (is_client && con->state == PARSED)
         resolve_server_address(con, loop);
     if (is_client && con->state == RESOLVED)
         initiate_server_connect(con, loop);
+
+    update_connection(con, loop);
+}
+
+/*
+ * Common tail of the socket and DNS callbacks: relay half-closes, close the
+ * remaining socket once the data destined for it has been flushed, then
+ * either free the connection or rearm its watchers.
+ */
+static void
+update_connection(struct Connection *con, struct ev_loop *loop) {
+    if (con->state == CONNECTED)
+        relay_shutdowns(con, loop);
 
     /* Close other socket if we have flushed corresponding buffer */
     if (con->state == SERVER_CLOSED && buffer_len(con->server.buffer) == 0)
@@ -294,16 +395,189 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
         close_server_socket(con, loop);
 
     if (con->state == CLOSED) {
-        TAILQ_REMOVE(&connections, con, entries);
-
-        if (con->listener->access_log)
-            log_connection(con);
-
-        free_connection(con);
+        retire_connection(con);
         return;
     }
 
     reactivate_watchers(con, loop);
+}
+
+/*
+ * Relay half-closes: once a peer has shut down its sending side and all the
+ * data it sent has been flushed to the other peer, shut down our sending side
+ * toward that other peer so it sees the end of stream too. Data keeps flowing
+ * in the opposite direction until that peer shuts down as well, at which point
+ * both sockets are closed.
+ */
+static void
+relay_shutdowns(struct Connection *con, struct ev_loop *loop) {
+    assert(con->state == CONNECTED);
+
+    if (con->client.eof && !con->server.shut_wr &&
+            buffer_len(con->client.buffer) == 0) {
+        if (shutdown(con->server.watcher.fd, SHUT_WR) < 0) {
+            warn("shutdown(server): %s, closing connection", strerror(errno));
+            close_server_socket(con, loop);
+            return;
+        }
+        con->server.shut_wr = 1;
+    }
+
+    if (con->server.eof && !con->client.shut_wr &&
+            buffer_len(con->server.buffer) == 0) {
+        if (shutdown(con->client.watcher.fd, SHUT_WR) < 0) {
+            warn("shutdown(client): %s, closing connection", strerror(errno));
+            close_client_socket(con, loop);
+            return;
+        }
+        con->client.shut_wr = 1;
+    }
+
+    /* Both directions have finished */
+    if (con->client.shut_wr && con->server.shut_wr)
+        close_connection(con, loop);
+}
+
+/*
+ * Periodic sweep closing connections which have exceeded their listener's
+ * request or idle timeout
+ *
+ * One timer serves every connection rather than each having its own. The
+ * whole queue is examined on each sweep, least recently active first. The
+ * queue is ordered by activity, but request deadlines run from accept time
+ * and timeouts differ per listener (and change on reload), so a connection
+ * which has not timed out does not imply the ones after it have not. Each
+ * check is a few comparisons, small next to the I/O those connections do.
+ */
+static void
+timeout_cb(struct ev_loop *loop, struct ev_timer *w,
+        int revents __attribute__((unused))) {
+    ev_tstamp now = monotonic_time();
+    struct Connection *con = TAILQ_LAST(&connections, ConnectionHead);
+    int closed = 0;
+
+    while (con != NULL) {
+        /* Fetch the next connection first since con may be freed. Timing out
+         * a connection frees only that connection, so prev remains valid. */
+        struct Connection *prev = TAILQ_PREV(con, ConnectionHead, entries);
+
+        closed += check_connection_timeout(con, now, loop);
+
+        if (closed >= TIMEOUT_SWEEP_MAX_CLOSE && prev != NULL) {
+            /* Let the event loop run, and pick up where we left off: the
+             * connections already checked and kept are checked again */
+            ev_timer_stop(loop, w);
+            ev_timer_set(w, TIMEOUT_SWEEP_CONTINUE, TIMEOUT_SWEEP_INTERVAL);
+            ev_timer_start(loop, w);
+            return;
+        }
+
+        con = prev;
+    }
+
+    if (TAILQ_EMPTY(&connections))
+        ev_timer_stop(loop, w); /* restarted by accept_connection() */
+}
+
+/*
+ * Close and free con if it has exceeded any of its listener's timeouts,
+ * returns 1 if it was closed
+ *
+ * The request timeout limits how long after accepting the connection we may
+ * still be waiting for the client's complete request or resolving the
+ * server's address. It runs from accept time, so it also bounds clients
+ * which trickle their request a byte at a time (slowloris).
+ *
+ * The idle timeout limits how long no data may be received or sent on
+ * either socket, in any state.
+ *
+ * The half close timeout limits how long a connection on which one peer has
+ * finished may stay idle waiting for the other peer to finish too.
+ */
+static int
+check_connection_timeout(struct Connection *con, ev_tstamp now,
+        struct ev_loop *loop) {
+    const struct Listener *listener = con->listener;
+    char client[ADDRESS_BUFFER_SIZE];
+
+    if (listener->request_timeout > 0 && server_connect_pending(con) &&
+            now - con->accepted_monotonic >= listener->request_timeout) {
+        display_sockaddr(&con->client.addr, client, sizeof(client));
+
+        if (con->state == RESOLVING)
+            notice("Timed out after %d seconds resolving server address for "
+                    "request %.*s from %s, closing connection",
+                    listener->request_timeout,
+                    con->hostname != NULL ? (int)con->hostname_len : 0,
+                    con->hostname != NULL ? con->hostname : "",
+                    client);
+        else
+            notice("Request from %s not received within %d seconds, "
+                    "closing connection",
+                    client, listener->request_timeout);
+    } else if (listener->idle_timeout > 0 &&
+            now - connection_last_activity(con) >= listener->idle_timeout) {
+        info("Connection from %s idle for %d seconds, closing connection",
+                display_sockaddr(&con->client.addr, client, sizeof(client)),
+                listener->idle_timeout);
+    } else if (listener->half_close_timeout > 0 &&
+            connection_half_closed(con) &&
+            now - connection_last_activity(con) >=
+                listener->half_close_timeout) {
+        /* One peer has finished, and the other has neither finished too nor
+         * sent or read anything since: e.g. a client which never closes after
+         * the server did, or a server which never answers a client which
+         * half-closed. We no longer read from a peer after its end of stream,
+         * so we would not otherwise notice if it went away. */
+        info("Half-closed connection from %s idle for %d seconds, "
+                "closing connection",
+                display_sockaddr(&con->client.addr, client, sizeof(client)),
+                listener->half_close_timeout);
+    } else {
+        return 0;
+    }
+
+    /* Discard anything still buffered: an expired connection gets no
+     * further chances to make progress. Closing the client socket cancels
+     * any DNS query in progress, so resolv_cb() will not be called. */
+    close_connection(con, loop);
+    retire_connection(con);
+
+    return 1;
+}
+
+/*
+ * monotonic_time() of the most recent receive or send on either socket, or of
+ * accepting the connection or starting to connect to the server if later
+ */
+static ev_tstamp
+connection_last_activity(const struct Connection *con) {
+    ev_tstamp last = con->accepted_monotonic;
+
+    /* Starting to connect to the server counts too: time spent resolving
+     * the server's address is covered by the request timeout, and must not
+     * count as idle time once the connection is established */
+    last = MAX(last, con->connect_monotonic);
+    last = MAX(last, con->client.buffer->last_activity);
+    last = MAX(last, con->server.buffer->last_activity);
+
+    return last;
+}
+
+/*
+ * Remove a connection whose sockets have both been closed from the queue,
+ * record it in the access log and free it
+ */
+static void
+retire_connection(struct Connection *con) {
+    assert(con->state == CLOSED);
+
+    TAILQ_REMOVE(&connections, con, entries);
+
+    if (con->listener->access_log)
+        log_connection(con);
+
+    free_connection(con);
 }
 
 static void
@@ -314,15 +588,25 @@ reactivate_watchers(struct Connection *con, struct ev_loop *loop) {
     /* Reactivate watchers */
     if (client_socket_open(con))
         reactivate_watcher(loop, client_watcher,
-                con->client.buffer, con->server.buffer);
+                con->client.buffer, con->client.eof, con->server.buffer);
 
     if (server_socket_open(con))
         reactivate_watcher(loop, server_watcher,
-                con->server.buffer, con->client.buffer);
+                con->server.buffer, con->server.eof, con->client.buffer);
 
     /* Neither watcher is active when the corresponding socket is closed */
     assert(client_socket_open(con) || !ev_is_active(client_watcher));
     assert(server_socket_open(con) || !ev_is_active(server_watcher));
+
+    /* No watcher reads from a peer which has shut down its sending side */
+    assert(!con->client.eof || !ev_is_active(client_watcher) ||
+           !(client_watcher->events & EV_READ));
+    assert(!con->server.eof || !ev_is_active(server_watcher) ||
+           !(server_watcher->events & EV_READ));
+
+    /* No data is queued toward a peer after we shut down sending to it */
+    assert(!con->client.shut_wr || buffer_len(con->server.buffer) == 0);
+    assert(!con->server.shut_wr || buffer_len(con->client.buffer) == 0);
 
     /* At least one watcher is still active for this connection,
      * or DNS callback active */
@@ -337,11 +621,11 @@ reactivate_watchers(struct Connection *con, struct ev_loop *loop) {
 
 static void
 reactivate_watcher(struct ev_loop *loop, struct ev_io *w,
-        const struct Buffer *input_buffer,
+        const struct Buffer *input_buffer, int input_eof,
         const struct Buffer *output_buffer) {
     int events = 0;
 
-    if (buffer_room(input_buffer))
+    if (!input_eof && buffer_room(input_buffer))
         events |= EV_READ;
 
     if (buffer_len(output_buffer))
@@ -361,19 +645,55 @@ reactivate_watcher(struct ev_loop *loop, struct ev_io *w,
     }
 }
 
+static int
+is_ipv4_mapped(const struct sockaddr_storage *ss) {
+    return ss->ss_family == AF_INET6 &&
+        IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *)ss)->sin6_addr);
+}
+
+/*
+ * Convert an IPv4-mapped IPv6 address (::ffff:192.0.2.1), as reported for
+ * IPv4 clients of a dual-stack listener, to the equivalent IPv4 address.
+ */
+static void
+unmap_ipv4_address(struct sockaddr_storage *ss) {
+    const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)ss;
+    struct sockaddr_in in;
+
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_port = in6->sin6_port;
+    memcpy(&in.sin_addr, &in6->sin6_addr.s6_addr[12], sizeof(in.sin_addr));
+
+    memset(ss, 0, sizeof(*ss));
+    memcpy(ss, &in, sizeof(in));
+}
+
 static void
 insert_proxy_v1_header(struct Connection *con) {
     char buf[INET6_ADDRSTRLEN] = { '\0' };
     size_t buf_len;
+    struct sockaddr_storage client_addr = con->client.addr;
+    struct sockaddr_storage local_addr = con->client.local_addr;
+
+    /*
+     * An IPv4 client of a dual-stack listener is reported with IPv4-mapped
+     * addresses; describe it as TCP4 as the PROXY protocol expects, many
+     * receivers do not accept mapped addresses in a TCP6 header.
+     */
+    if (is_ipv4_mapped(&client_addr) && is_ipv4_mapped(&local_addr)) {
+        unmap_ipv4_address(&client_addr);
+        unmap_ipv4_address(&local_addr);
+    }
 
     con->header_len += buffer_push(con->client.buffer, "PROXY ", 6);
 
-    switch (con->client.addr.ss_family) {
+    switch (client_addr.ss_family) {
         case AF_INET:
             con->header_len += buffer_push(con->client.buffer, "TCP4 ", 5);
 
             inet_ntop(AF_INET,
-                      &((const struct sockaddr_in *)&con->client.addr)->
+                      &((const struct sockaddr_in *)&client_addr)->
                       sin_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
@@ -381,26 +701,26 @@ insert_proxy_v1_header(struct Connection *con) {
             con->header_len += buffer_push(con->client.buffer, " ", 1);
 
             inet_ntop(AF_INET,
-                      &((const struct sockaddr_in *)&con->client.local_addr)->
+                      &((const struct sockaddr_in *)&local_addr)->
                       sin_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in *)&con->
-                              client.addr)->sin_port));
+                              ntohs(((const struct sockaddr_in *)&
+                              client_addr)->sin_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in *)&con->
-                              client.local_addr)->sin_port));
+                              ntohs(((const struct sockaddr_in *)&
+                              local_addr)->sin_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             break;
         case AF_INET6:
             con->header_len += buffer_push(con->client.buffer, "TCP6 ", 5);
             inet_ntop(AF_INET6,
-                    &((const struct sockaddr_in6 *)&con->client.addr)->
+                    &((const struct sockaddr_in6 *)&client_addr)->
                     sin6_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
@@ -408,19 +728,19 @@ insert_proxy_v1_header(struct Connection *con) {
             con->header_len += buffer_push(con->client.buffer, " ", 1);
 
             inet_ntop(AF_INET6,
-                      &((const struct sockaddr_in6 *)&con->
-                      client.local_addr)->sin6_addr, buf, sizeof(buf));
+                      &((const struct sockaddr_in6 *)&
+                      local_addr)->sin6_addr, buf, sizeof(buf));
             buf_len = strlen(buf);
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in6 *)&con->
-                              client.addr)->sin6_port));
+                              ntohs(((const struct sockaddr_in6 *)&
+                              client_addr)->sin6_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
-                              ntohs(((const struct sockaddr_in6 *)&con->
-                              client.local_addr)->sin6_port));
+                              ntohs(((const struct sockaddr_in6 *)&
+                              local_addr)->sin6_port));
             con->header_len += buffer_push(con->client.buffer, buf, buf_len);
 
             break;
@@ -444,11 +764,33 @@ parse_client_request(struct Connection *con) {
     payload_len -= con->header_len;
 
     int result = con->listener->protocol->parse_packet(payload, payload_len, &hostname);
+    if (result > 0 && memchr(hostname, '\0', (size_t)result) != NULL) {
+        /* A hostname can't contain a NUL byte, and the rest of sniproxy
+         * would see the hostname truncated at it, treat as malformed */
+        free(hostname);
+        hostname = NULL;
+        result = -5;
+    }
+
     if (result < 0) {
         char client[INET6_ADDRSTRLEN + 8];
 
-        if (result == -1) { /* incomplete request */
+        if (result == -1 && con->client.eof) { /* incomplete request */
+            warn("Request from %s incomplete when client shut down connection",
+                    display_sockaddr(&con->client.addr, client, sizeof(client)));
+        } else if (result == -1) { /* incomplete request */
             if (buffer_room(con->client.buffer) > 0)
+                return; /* give client a chance to send more data */
+
+            /*
+             * Buffer is full: grow it, up to a limit, to accommodate large
+             * requests. TLS client hellos can be up to a full 16 KiB record
+             * (large session tickets, post-quantum key shares) and HTTP
+             * requests may carry large cookies.
+             */
+            size_t size = buffer_size(con->client.buffer);
+            if (size < MAX_REQUEST_BUFFER_SIZE &&
+                    buffer_resize(con->client.buffer, size * 2) >= 0)
                 return; /* give client a chance to send more data */
 
             warn("Request from %s exceeded %zu byte buffer size",
@@ -470,6 +812,12 @@ parse_client_request(struct Connection *con) {
             abort_connection(con);
             return;
         }
+
+        /* Continue to the fallback without a hostname; result is an error
+         * code, not a length */
+        free(hostname);
+        hostname = NULL;
+        result = 0;
     }
 
     con->hostname = hostname;
@@ -510,6 +858,22 @@ resolve_server_address(struct Connection *con, struct ev_loop *loop) {
 
         return;
 #else
+        /*
+         * The DNS query outlives this call, but unless the lookup handed us
+         * our own copy, result.address points into the running configuration
+         * (a table backend or the listener's fallback) which a reload can
+         * free before the query completes. Take a private copy.
+         */
+        if (!result.caller_free_address) {
+            result.address = copy_address(result.address);
+            if (result.address == NULL) {
+                err("%s: copy_address", __func__);
+                abort_connection(con);
+                return;
+            }
+            result.caller_free_address = 1;
+        }
+
         struct resolv_cb_data *cb_data = malloc(sizeof(struct resolv_cb_data));
         if (cb_data == NULL) {
             err("%s: malloc", __func__);
@@ -554,12 +918,14 @@ resolve_server_address(struct Connection *con, struct ev_loop *loop) {
         if (con->query_handle == NULL) {
             /*
              * resolv_query() failed to submit the query (and has already
-             * run free_resolv_cb_data on cb_data). Do not enter RESOLVING
-             * with a NULL query_handle: close_client_socket() would then
-             * call resolv_cancel(NULL) and dereference it.
+             * run free_resolv_cb_data on cb_data, freeing result.address).
+             * Do not enter RESOLVING with a NULL query_handle:
+             * close_client_socket() would then call resolv_cancel(NULL) and
+             * dereference it.
              */
-            notice("unable to submit DNS query for %s, closing connection",
-                    address_hostname(result.address));
+            notice("unable to submit DNS query for request %.*s, closing connection",
+                    con->hostname != NULL ? (int)con->hostname_len : 0,
+                    con->hostname != NULL ? con->hostname : "");
             abort_connection(con);
             return;
         }
@@ -614,7 +980,9 @@ resolv_cb(struct Address *result, void *data) {
     }
 
     con->query_handle = NULL;
-    reactivate_watchers(con, loop);
+    /* The client may have shut down its sending side while we were
+     * resolving, and the connection may already be finished */
+    update_connection(con, loop);
 }
 
 static void
@@ -730,6 +1098,7 @@ initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
     ev_io_init(server_watcher, connection_cb, sockfd, EV_WRITE);
     con->server.watcher.data = con;
     con->state = CONNECTED;
+    con->connect_monotonic = monotonic_time();
 
     ev_io_start(loop, server_watcher);
 }
@@ -749,6 +1118,7 @@ close_client_socket(struct Connection *con, struct ev_loop *loop) {
 
     if (con->state == RESOLVING) {
         resolv_cancel(con->query_handle);
+        con->query_handle = NULL;
         con->state = PARSED;
     }
 
@@ -825,13 +1195,13 @@ new_connection(struct ev_loop *loop) {
     con->query_handle = NULL;
     con->use_proxy_header = 0;
 
-    con->client.buffer = new_buffer(4096, loop);
+    con->client.buffer = new_buffer(BUFFER_SIZE, loop);
     if (con->client.buffer == NULL) {
         free_connection(con);
         return NULL;
     }
 
-    con->server.buffer = new_buffer(4096, loop);
+    con->server.buffer = new_buffer(BUFFER_SIZE, loop);
     if (con->server.buffer == NULL) {
         free_connection(con);
         return NULL;
@@ -848,7 +1218,11 @@ log_connection(struct Connection *con) {
     char client_address[ADDRESS_BUFFER_SIZE];
     char listener_address[ADDRESS_BUFFER_SIZE];
     char server_address[ADDRESS_BUFFER_SIZE];
-
+    /* Requests without a hostname (sent to the fallback) used to pass NULL
+     * to %s, keep glibc's rendering of that for log parsers */
+    const char *hostname = con->hostname != NULL ? con->hostname : "(null)";
+    int hostname_len = con->hostname != NULL ?
+        (int)con->hostname_len : (int)strlen(hostname);
 
     display_sockaddr(&con->client.addr, client_address, sizeof(client_address));
     display_sockaddr(&con->client.local_addr, listener_address, sizeof(listener_address));
@@ -860,8 +1234,8 @@ log_connection(struct Connection *con) {
            client_address,
            listener_address,
            server_address,
-           (int)con->hostname_len,
-           con->hostname,
+           hostname_len,
+           hostname,
            con->server.buffer->tx_bytes,
            con->server.buffer->rx_bytes,
            con->client.buffer->tx_bytes,

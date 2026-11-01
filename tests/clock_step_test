@@ -1,0 +1,285 @@
+#!/usr/bin/env perl
+
+# Timeouts measure elapsed time on the monotonic clock, so stepping the wall
+# clock must neither trigger nor suspend them. sniproxy runs with an
+# LD_PRELOAD shim which steps CLOCK_REALTIME (and gettimeofday() and time())
+# by an hour a couple of seconds after it starts:
+#  - stepped forward, a connection which was last active a second before on a
+#    listener with idle_timeout 300 must stay open;
+#  - stepped backward, a client which never sends its request to a listener
+#    with request_timeout 3 must still be disconnected after about 3 seconds.
+#
+# The shim is built with the C compiler, so the test is skipped without one,
+# and on systems other than Linux.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use File::Temp;
+use IO::Socket::INET;
+use IO::Select;
+use Socket;
+use Time::HiRes qw(time sleep);
+
+my $step_after = 2;
+my $request_timeout = 3;
+
+my $shim_source = <<'END';
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+
+static int (*real_clock_gettime)(clockid_t, struct timespec *);
+static struct timespec start;
+static double step_after, step_by;
+
+static void
+init(void) {
+    if (real_clock_gettime != NULL)
+        return;
+    real_clock_gettime = (int (*)(clockid_t, struct timespec *))
+        dlsym(RTLD_NEXT, "clock_gettime");
+    real_clock_gettime(CLOCK_MONOTONIC, &start);
+    step_after = atof(getenv("CLOCK_STEP_AFTER") ? getenv("CLOCK_STEP_AFTER") : "0");
+    step_by = atof(getenv("CLOCK_STEP_BY") ? getenv("CLOCK_STEP_BY") : "0");
+}
+
+static time_t
+offset(void) {
+    struct timespec now;
+    real_clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (double)(now.tv_sec - start.tv_sec) +
+                     (double)(now.tv_nsec - start.tv_nsec) * 1e-9;
+    return elapsed >= step_after ? (time_t)step_by : 0;
+}
+
+int
+clock_gettime(clockid_t clock, struct timespec *ts) {
+    init();
+    int result = real_clock_gettime(clock, ts);
+    if (result == 0 && (clock == CLOCK_REALTIME
+#ifdef CLOCK_REALTIME_COARSE
+                || clock == CLOCK_REALTIME_COARSE
+#endif
+                ))
+        ts->tv_sec += offset();
+    return result;
+}
+
+int
+gettimeofday(struct timeval *tv, void *tz) {
+    struct timespec ts;
+    (void)tz;
+    init();
+    if (real_clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return -1;
+    tv->tv_sec = ts.tv_sec + offset();
+    tv->tv_usec = ts.tv_nsec / 1000;
+    return 0;
+}
+
+time_t
+time(time_t *t) {
+    struct timespec ts;
+    init();
+    real_clock_gettime(CLOCK_REALTIME, &ts);
+    time_t now = ts.tv_sec + offset();
+    if (t != NULL)
+        *t = now;
+    return now;
+}
+END
+
+sub build_shim($) {
+    my $dir = shift;
+    my $cc = $ENV{CC} || 'cc';
+
+    open(my $fh, '>', "$dir/clock_step.c") or die "open: $!";
+    print $fh $shim_source;
+    close($fh);
+
+    # Without sanitizer flags: the shim only wraps libc functions. TestUtils'
+    # SIGCHLD handler would reap the compiler before system() could.
+    local $SIG{CHLD} = 'DEFAULT';
+    system("$cc -shared -fPIC -o $dir/clock_step.so $dir/clock_step.c -ldl " .
+           ">/dev/null 2>&1");
+    return $? == 0 ? "$dir/clock_step.so" : undef;
+}
+
+sub proxy {
+    my ($config, $shim, $step_by, @args) = @_;
+
+    $ENV{LD_PRELOAD} = $shim;
+    $ENV{CLOCK_STEP_AFTER} = $step_after;
+    $ENV{CLOCK_STEP_BY} = $step_by;
+    # An ASan build insists on its runtime coming first otherwise
+    $ENV{ASAN_OPTIONS} = join(':', grep { defined && length }
+                              $ENV{ASAN_OPTIONS}, 'verify_asan_link_order=0');
+
+    exec(@args, '../src/sniproxy', '-f', '-c', $config);
+}
+
+sub echo_server($) {
+    my $port = shift;
+
+    my $server = IO::Socket::INET->new(Listen => 5,
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       Proto => 'tcp',
+                                       ReuseAddr => 1)
+        or die "listen: $!\n";
+
+    while (my $client = $server->accept()) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid) {
+            close($client);
+            next;
+        }
+        close($server);
+        while (sysread($client, my $chunk, 4096)) {
+            syswrite($client, $chunk);
+        }
+        exit 0;
+    }
+}
+
+sub connect_proxy($) {
+    my $port = shift;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp')
+        or die "connect: $!\n";
+
+    return $socket;
+}
+
+# Send a line and expect it echoed back
+sub echo($$) {
+    my ($socket, $line) = @_;
+
+    syswrite($socket, $line) or return 0;
+    my $select = IO::Select->new($socket);
+    my $data = '';
+    while (length($data) < length($line)) {
+        return 0 unless $select->can_read(3);
+        my $bytes = sysread($socket, my $chunk, 4096);
+        return 0 unless $bytes;
+        $data .= $chunk;
+    }
+
+    return $data eq $line;
+}
+
+# Returns undef if the socket was closed before the deadline, else 1
+sub open_until($$) {
+    my ($socket, $deadline) = @_;
+    my $select = IO::Select->new($socket);
+
+    while ((my $left = $deadline - time()) > 0) {
+        next unless $select->can_read($left);
+        my $bytes = sysread($socket, my $chunk, 4096);
+        return undef unless $bytes;
+    }
+
+    return 1;
+}
+
+sub run_proxy($$$$) {
+    my ($shim, $step_by, $proxy_port, $echo_port) = @_;
+
+    my $dir = world_readable_tempdir();
+    my $config = "$dir/sniproxy.conf";
+    open(my $fh, '>', $config) or die "open: $!";
+    print $fh <<END;
+listen 127.0.0.1:$proxy_port {
+    proto http
+    table backends
+    request_timeout $request_timeout
+    idle_timeout 300
+}
+
+table backends {
+    ^echo\\.test\$ 127.0.0.1:$echo_port
+}
+END
+    close($fh);
+    chmod(0644, $config);
+
+    my $pid = start_child('server', \&proxy, $config, $shim, $step_by, @ARGV);
+    wait_for_port(port => $proxy_port);
+
+    return $pid;
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $echo_port = $ENV{TEST_HTTPD_PORT} || 8081;
+
+    unless ($^O eq 'linux') {
+        print "This test requires Linux\n";
+        exit 77;
+    }
+
+    my $build_dir = File::Temp::tempdir(CLEANUP => 1);
+    my $shim = build_shim($build_dir);
+    unless ($shim) {
+        print "Unable to build the clock step shim, skipping\n";
+        exit 77;
+    }
+    chmod(0755, $build_dir);
+
+    start_child('server', \&echo_server, $echo_port);
+    wait_for_port(port => $echo_port);
+
+    my $failure;
+
+    # Forward: the connection in use must not be taken for idle
+    my $proxy_pid = run_proxy($shim, 3600, $proxy_port, $echo_port);
+    my $start = time();
+    my $active = connect_proxy($proxy_port);
+    # The echo server sends the request back too
+    $failure = "connection not established through the proxy"
+        unless echo($active, "GET / HTTP/1.1\r\nHost: echo.test\r\n\r\n");
+    # Quiet across the step, as connections in use often are for a moment:
+    # its last activity is then from before the step
+    unless ($failure || open_until($active, $start + $step_after + 2.5)) {
+        $failure = sprintf("connection closed %.1fs after the wall clock was " .
+                           "stepped forward", time() - $start - $step_after);
+    }
+    $failure = "connection not usable after the wall clock was stepped forward"
+        unless $failure || echo($active, "ping\n");
+    close($active);
+    kill 15, $proxy_pid;
+    sleep 1;
+
+    # Backward: the request timeout must still close a silent client
+    unless ($failure) {
+        $proxy_pid = run_proxy($shim, -3600, $proxy_port, $echo_port);
+        my $silent = connect_proxy($proxy_port);
+        $start = time();
+        if (open_until($silent, $start + $request_timeout + 3)) {
+            $failure = sprintf("silent client still connected %.1fs after " .
+                               "connecting, with request_timeout %d and the " .
+                               "wall clock stepped back", time() - $start,
+                               $request_timeout);
+        }
+        close($silent);
+        kill 15, $proxy_pid;
+        sleep 1;
+    }
+
+    reap_children();
+
+    if ($failure) {
+        print "Test failed: $failure\n";
+        exit 1;
+    }
+}
+
+main();

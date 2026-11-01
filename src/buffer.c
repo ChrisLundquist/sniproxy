@@ -64,6 +64,7 @@ new_buffer(size_t size, struct ev_loop *loop) {
     buf->rx_bytes = 0;
     buf->last_recv = ev_now(loop);
     buf->last_send = ev_now(loop);
+    buf->last_activity = monotonic_time();
     buf->buffer = malloc(size);
     if (buf->buffer == NULL) {
         free(buf);
@@ -122,6 +123,7 @@ buffer_recv(struct Buffer *buffer, int sockfd, int flags, struct ev_loop *loop) 
     ssize_t bytes = recvmsg(sockfd, &msg, flags);
 
     buffer->last_recv = ev_now(loop);
+    buffer->last_activity = monotonic_time();
 
     if (bytes > 0)
         advance_write_position(buffer, (size_t)bytes);
@@ -140,6 +142,7 @@ buffer_send(struct Buffer *buffer, int sockfd, int flags, struct ev_loop *loop) 
     ssize_t bytes = sendmsg(sockfd, &msg, flags);
 
     buffer->last_send = ev_now(loop);
+    buffer->last_activity = monotonic_time();
 
     if (bytes > 0)
         advance_read_position(buffer, (size_t)bytes);
@@ -189,10 +192,8 @@ buffer_write(struct Buffer *buffer, int fd) {
  */
 size_t
 buffer_coalesce(struct Buffer *buffer, const void **dst) {
-    size_t buffer_tail = (buffer->head + buffer->len) & buffer->size_mask;
-
-    if (buffer_tail <= buffer->head) {
-        /* buffer not wrapped */
+    if (buffer->head + buffer->len <= buffer_size(buffer)) {
+        /* buffer not wrapped: contents are already contiguous */
         if (dst != NULL)
             *dst = &buffer->buffer[buffer->head];
 

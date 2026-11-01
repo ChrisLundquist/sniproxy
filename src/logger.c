@@ -120,12 +120,24 @@ reopen_loggers(void) {
             closelog();
             openlog(PACKAGE_NAME, LOG_PID, 0);
         } else if (sink->type == LOG_SINK_FILE) {
-            sink->fd = freopen(sink->filepath, "a", sink->fd);
-            if (sink->fd == NULL)
+            /*
+             * Open the new file before closing the old one: freopen() closes
+             * the original stream even when it fails, which would leave a
+             * NULL stream behind (and crash the next reopen or fclose()).
+             * If the file can't be reopened, e.g. it was created by root
+             * before privileges were dropped, keep logging to the old one.
+             */
+            FILE *fd = fopen(sink->filepath, "a");
+            if (fd == NULL) {
                 err("failed to reopen log file %s: %s",
                         sink->filepath, strerror(errno));
-            else
-                setvbuf(sink->fd, NULL, _IOLBF, 0);
+                continue;
+            }
+
+            setvbuf(fd, NULL, _IOLBF, 0);
+            if (sink->fd != NULL)
+                fclose(sink->fd);
+            sink->fd = fd;
         }
     }
 }
@@ -261,7 +273,7 @@ vlog_msg(struct Logger *logger, int priority, const char *format, va_list args) 
         return;
 
     if (logger->sink->type == LOG_SINK_SYSLOG) {
-        vsyslog(logger->facility|logger->priority, format, args);
+        vsyslog(logger->facility | priority, format, args);
     } else if (logger->sink->fd != NULL) {
         char buffer[1024];
 
@@ -405,9 +417,18 @@ obtain_file_sink(const char *filepath) {
     if (sink == NULL)
         return NULL;
 
+    /* The path identifies the sink in the shared list and is needed to
+     * reopen it, so a sink without one must never be added */
+    sink->filepath = strdup(filepath);
+    if (sink->filepath == NULL) {
+        free(sink);
+        err("%s: strdup", __func__);
+        return NULL;
+    }
 
     FILE *fd = fopen(filepath, "a");
     if (fd == NULL) {
+        free((char *)sink->filepath);
         free(sink);
         err("Failed to open new log file: %s", filepath);
         return NULL;
@@ -415,7 +436,6 @@ obtain_file_sink(const char *filepath) {
     setvbuf(fd, NULL, _IOLBF, 0);
 
     sink->type = LOG_SINK_FILE;
-    sink->filepath = strdup(filepath);
     sink->fd = fd;
     sink->reference_count = 0;
 
@@ -459,7 +479,8 @@ free_sink(struct LogSink *sink) {
             sink->fd = NULL;
             break;
         case LOG_SINK_FILE:
-            fclose(sink->fd);
+            if (sink->fd != NULL)
+                fclose(sink->fd);
             sink->fd = NULL;
             free((char *)sink->filepath);
             sink->filepath = NULL;

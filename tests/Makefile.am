@@ -14,19 +14,34 @@ TESTS = address_test \
 TESTS += functional_test \
          bad_request_test \
          bind_source_test \
+         clock_step_test \
          connection_reset_test \
+         half_close_test \
+         half_close_timeout_test \
          fallback_test \
          fd_limit_test \
+         idle_timeout_test \
          ipv6_v6only_test \
+         large_request_test \
          proxy_header_test \
+         proxy_header_ipv4_mapped_test \
          reload_test \
+         reload_listener_test \
+         reload_log_test \
+         request_timeout_test \
          reuseport_test \
          slow_client_test \
+         split_host_test \
          transparent_proxy_test
 if DNS_ENABLED
   TESTS += config_test \
            resolv_test \
-           bad_dns_request_test
+           config_errors_test \
+           bad_dns_request_test \
+           reload_dns_test \
+           request_timeout_dns_test \
+           resolver_config_test \
+           half_close_dns_test
 endif
 
 check_PROGRAMS = http_test \

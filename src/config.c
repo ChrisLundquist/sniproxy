@@ -28,6 +28,21 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#ifdef HAVE_LIBUDNS
+#include <udns.h>
+#define MAX_NAMESERVERS DNS_MAXSERV
+/*
+ * udns keeps the search list as consecutive wire format names, terminated by
+ * an empty name, in a 1024 byte buffer: their total length can be at most
+ * 1023 bytes. A wire format name is two bytes longer than its text form.
+ */
+#define MAX_SEARCH_LIST_LEN 1023
+#else
+#define MAX_NAMESERVERS 6 /* udns's DNS_MAXSERV */
+#endif
 #include "cfg_parser.h"
 #include "config.h"
 #include "logger.h"
@@ -47,6 +62,10 @@ static int end_listener_stanza(struct Config *, struct Listener *);
 static int end_table_stanza(struct Config *, struct Table *);
 static int end_backend(struct Table *, struct Backend *);
 static struct LoggerBuilder *new_logger_builder(void);
+static void free_logger_builder(struct LoggerBuilder *);
+static void free_resolver_config(struct ResolverConfig *);
+static void free_listener_stanza(struct Listener *);
+static void free_table_stanza(struct Table *);
 static int accept_logger_filename(struct LoggerBuilder *, const char *);
 static int accept_logger_syslog_facility(struct LoggerBuilder *, const char *);
 static int accept_logger_priority(struct LoggerBuilder *, const char *);
@@ -131,10 +150,25 @@ static const struct Keyword listener_stanza_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_logger_filename,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_listener_access_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="bad_requests",
         .parse_arg= (int(*)(void *, const char *))accept_listener_bad_request_action,
+    },
+    /* Keywords are matched by prefix in order: add new keywords after the
+     * existing ones so abbreviations (e.g. "re" for reuseport) still work */
+    {
+        .keyword="request_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_request_timeout,
+    },
+    {
+        .keyword="idle_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_idle_timeout,
+    },
+    {
+        .keyword="half_close_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_half_close_timeout,
     },
     {
         .keyword = NULL,
@@ -146,6 +180,7 @@ static struct Keyword table_stanza_grammar[] = {
         .create=(void *(*)(void))new_backend,
         .parse_arg=(int(*)(void *, const char *))accept_backend_arg,
         .finalize=(int(*)(void *, void *))end_backend,
+        .free=(void(*)(void *))free_backend,
     },
     {
         .keyword = NULL,
@@ -170,18 +205,21 @@ static struct Keyword global_grammar[] = {
         .create=(void *(*)(void))new_resolver_config,
         .block_grammar=resolver_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_resolver_stanza,
+        .free=(void(*)(void *))free_resolver_config,
     },
     {
         .keyword="error_log",
         .create=(void *(*)(void))new_logger_builder,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_error_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="access_log",
         .create=(void *(*)(void))new_logger_builder,
         .block_grammar=logger_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_global_access_logger_stanza,
+        .free=(void(*)(void *))free_logger_builder,
     },
     {
         .keyword="listener",
@@ -189,6 +227,7 @@ static struct Keyword global_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_listener_arg,
         .block_grammar=listener_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_listener_stanza,
+        .free=(void(*)(void *))free_listener_stanza,
     },
     {
         .keyword="table",
@@ -196,6 +235,7 @@ static struct Keyword global_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_table_arg,
         .block_grammar=table_stanza_grammar,
         .finalize=(int(*)(void *, void *))end_table_stanza,
+        .free=(void(*)(void *))free_table_stanza,
     },
     {
         .keyword = NULL,
@@ -242,9 +282,15 @@ init_config(const char *filename, struct ev_loop *loop) {
         char line[256];
 
         err("error parsing %s at %jd near:", filename, whence);
-        fseek(file, -20, SEEK_CUR);
-        for (int i = 0; i < 5; i++)
-            err(" %jd\t%s", ftell(file), fgets(line, sizeof(line), file));
+        if (fseek(file, whence > 20 ? -20 : -whence, SEEK_CUR) == 0) {
+            for (int i = 0; i < 5; i++) {
+                intmax_t line_start = ftell(file);
+                if (fgets(line, sizeof(line), file) == NULL)
+                    break;
+                line[strcspn(line, "\r\n")] = '\0';
+                err(" %jd\t%s", line_start, line);
+            }
+        }
 
         free_config(config, loop);
         config = NULL;
@@ -408,7 +454,18 @@ end_table_stanza(struct Config *config, struct Table *table) {
 
 static int
 end_backend(struct Table *table, struct Backend *backend) {
-    /* TODO check backend */
+    if (backend->address == NULL) {
+        err("No address specified for table entry %s", backend->pattern);
+        free_backend(backend);
+        return -1;
+    }
+
+    /* Compile the pattern now so an invalid regular expression rejects the
+     * configuration, rather than failing at the first lookup */
+    if (!init_backend(backend)) {
+        free_backend(backend);
+        return -1;
+    }
 
     table->use_proxy_header = table->use_proxy_header ||
                               backend->use_proxy_header;
@@ -575,6 +632,36 @@ new_resolver_config(void) {
     return resolver;
 }
 
+/*
+ * Free the objects a stanza builds when the configuration is rejected before
+ * the stanza's end callback takes them over
+ */
+static void
+free_logger_builder(struct LoggerBuilder *lb) {
+    free((char *)lb->filename);
+    free((char *)lb->syslog_facility);
+    free(lb);
+}
+
+static void
+free_resolver_config(struct ResolverConfig *resolver) {
+    free_string_vector(resolver->nameservers);
+    free_string_vector(resolver->search);
+    free(resolver);
+}
+
+static void
+free_listener_stanza(struct Listener *listener) {
+    /* A new listener has no references yet */
+    listener_ref_put(listener_ref_get(listener));
+}
+
+static void
+free_table_stanza(struct Table *table) {
+    /* A new table has no references yet */
+    table_ref_put(table_ref_get(table));
+}
+
 static size_t
 string_vector_len(char **vector) {
     size_t len = 0;
@@ -619,13 +706,24 @@ free_string_vector(char **vector) {
 
 static int
 accept_resolver_nameserver(struct ResolverConfig *resolver, const char *nameserver) {
-    /* Validate address is a valid IP */
-    struct Address *ns_address = new_address(nameserver);
-    if (!address_is_sockaddr(ns_address)) {
-        free(ns_address);
+    /*
+     * Name servers are handed to udns's dns_add_serv(), which only accepts a
+     * numeric IPv4 or IPv6 address and always uses port 53. Reject anything
+     * else (a port, a unix socket, ...) here: udns would ignore it and, if no
+     * usable name server remained, silently query 127.0.0.1 instead.
+     */
+    struct in6_addr addr;
+    if (inet_pton(AF_INET, nameserver, &addr) != 1 &&
+            inet_pton(AF_INET6, nameserver, &addr) != 1) {
+        err("Invalid nameserver %s: expected an IPv4 or IPv6 address without a port",
+                nameserver);
         return -1;
     }
-    free(ns_address);
+
+    if (string_vector_len(resolver->nameservers) >= MAX_NAMESERVERS) {
+        err("Too many nameservers: at most %d are supported", MAX_NAMESERVERS);
+        return -1;
+    }
 
     return append_to_string_vector(&resolver->nameservers, nameserver);
 }
@@ -638,6 +736,29 @@ accept_resolver_search(struct ResolverConfig *resolver, const char *search) {
         return -1;
     }
     free(search_address);
+
+#ifdef HAVE_LIBUDNS
+    /* Reject a search list which won't fit in udns's buffer here, rather
+     * than have resolv_init() fail at startup */
+    size_t search_list_len = 0;
+    for (size_t i = 0; i < string_vector_len(resolver->search); i++) {
+        dnsc_t dn[DNS_MAXDN];
+        search_list_len += (size_t)dns_sptodn(resolver->search[i], dn, sizeof(dn));
+    }
+
+    dnsc_t dn[DNS_MAXDN];
+    int dn_len = dns_sptodn(search, dn, sizeof(dn));
+    if (dn_len <= 0) {
+        err("Invalid search domain %s", search);
+        return -1;
+    }
+    if (search_list_len + (size_t)dn_len > MAX_SEARCH_LIST_LEN) {
+        err("Search domain %s doesn't fit: the search domains may take up to "
+                "%d bytes in total, each one its length plus 2",
+                search, MAX_SEARCH_LIST_LEN);
+        return -1;
+    }
+#endif
 
     return append_to_string_vector(&resolver->search, search);
 }
@@ -655,6 +776,9 @@ accept_resolver_mode(struct ResolverConfig *resolver, const char *mode) {
 
 static int
 end_resolver_stanza(struct Config *config, struct ResolverConfig *resolver) {
+    /* A later resolver block replaces an earlier one */
+    free_string_vector(config->resolver.nameservers);
+    free_string_vector(config->resolver.search);
     config->resolver = *resolver;
     free(resolver);
 

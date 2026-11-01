@@ -119,17 +119,35 @@ resolv_init(struct ev_loop *loop, char **nameservers, char **search, int mode) {
         /* Nameservers not specified, use system resolver config */
         dns_init(ctx, 0);
     } else {
+        /*
+         * dns_reset() leaves the context in the same state dns_init() does
+         * before it reads /etc/resolv.conf, and dns_open() is called below.
+         */
         dns_reset(ctx);
 
+        /*
+         * A name server udns rejects must not be skipped: with none left
+         * dns_open() would fall back to 127.0.0.1.
+         */
         for (int i = 0; nameservers[i] != NULL; i++)
-            dns_add_serv(ctx, nameservers[i]);
-
-        if (search != NULL)
-            for (int i = 0; search[i] != NULL; i++)
-                dns_add_srch(ctx, search[i]);
+            if (dns_add_serv(ctx, nameservers[i]) < 0)
+                fatal("Unable to use nameserver %s: %s",
+                        nameservers[i], strerror(errno));
     }
 
-    default_resolv_mode = mode;
+    /* Configured search domains replace the system's, whether or not
+     * nameservers were configured */
+    if (search != NULL) {
+        dns_add_srch(ctx, NULL);
+        for (int i = 0; search[i] != NULL; i++)
+            if (dns_add_srch(ctx, search[i]) < 0)
+                fatal("Unable to use search domain %s: %s",
+                        search[i], strerror(errno));
+    }
+
+    /* Keep the documented IPv4 only default unless a mode was configured */
+    if (mode != RESOLV_MODE_DEFAULT)
+        default_resolv_mode = mode;
 
     int sockfd = dns_open(ctx);
     if (sockfd < 0)
@@ -230,6 +248,11 @@ resolv_cancel(struct ResolvQuery *query_handle) {
             cb_data->queries[i] = NULL;
         }
     }
+
+    /* Free responses from any queries which completed before the cancel */
+    for (size_t i = 0; i < cb_data->response_count; i++)
+        free(cb_data->responses[i]);
+    free(cb_data->responses);
 
     if (cb_data->client_free_cb != NULL)
         cb_data->client_free_cb(cb_data->client_cb_data);

@@ -1,0 +1,287 @@
+#!/usr/bin/env perl
+
+# Verify the listener request_timeout:
+#  - a client which connects and sends nothing is disconnected
+#  - so is a client which stalls part way through its request, on both HTTP
+#    and TLS listeners
+#  - a client trickling its request a byte at a time (slowloris) is
+#    disconnected even though it is never idle
+#  - a slow client which completes its request within the timeout is proxied
+#  - request_timeout 0 disables the timeout, and changing it on reload
+#    applies to connections which are already open
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use TestHTTPD;
+use File::Temp;
+use IO::Select;
+use IO::Socket::INET;
+use Time::HiRes qw(time sleep);
+
+# Seconds, short to keep the test fast. Connections are checked once a second
+# so a connection is closed between TIMEOUT and TIMEOUT + 1 seconds after it
+# was accepted, allow a little more for slow (e.g. sanitizer) builds.
+use constant TIMEOUT => 3;
+use constant EARLIEST_CLOSE => TIMEOUT - 0.5;
+use constant LATEST_CLOSE => TIMEOUT + 2.5;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+sub write_config {
+    my ($filename, $http_port, $tls_port, $disabled_port, $httpd_port,
+        $disabled_timeout) = @_;
+
+    open(my $fh, '>', $filename)
+        or die("open(): $!");
+
+    print $fh <<END;
+# Request timeout test configuration
+
+listen 127.0.0.1 $http_port {
+    proto http
+    request_timeout ${\ TIMEOUT}
+}
+
+listen 127.0.0.1 $tls_port {
+    proto tls
+    request_timeout ${\ TIMEOUT}
+}
+
+listen 127.0.0.1 $disabled_port {
+    proto http
+    request_timeout $disabled_timeout
+}
+
+table {
+    localhost 127.0.0.1 $httpd_port
+}
+END
+
+    close($fh);
+}
+
+sub connect_to {
+    my $port = shift;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp',
+                                       Type => SOCK_STREAM,
+                                       Timeout => 5)
+        or die "couldn't connect to $port: $!\n";
+
+    return $socket;
+}
+
+# Wait up to $limit seconds after $start for the proxy to close $socket.
+# Returns the number of seconds after $start the socket was closed, or undef
+# if it is still open, and any data received.
+sub wait_for_close {
+    my ($socket, $start, $limit) = @_;
+    my $select = IO::Select->new($socket);
+    my $data = '';
+
+    while ((my $remaining = $start + $limit - time) > 0) {
+        next unless $select->can_read($remaining);
+
+        my $bytes = sysread($socket, my $buffer, 4096);
+        # 0 is end of file, undef an error such as ECONNRESET
+        return (time - $start, $data) unless $bytes;
+
+        $data .= $buffer;
+    }
+
+    return (undef, $data);
+}
+
+sub expect_closed_in_time {
+    my ($what, $elapsed, $data) = @_;
+
+    die "$what: not disconnected within ${\ LATEST_CLOSE} seconds\n"
+        unless defined $elapsed;
+    die sprintf("%s: disconnected after %.2f seconds, before the %d second request timeout\n",
+                $what, $elapsed, TIMEOUT)
+        if $elapsed < EARLIEST_CLOSE;
+    # Timed out connections are closed without a response
+    die "$what: unexpected response: $data\n" if length $data;
+}
+
+# Send $request, if any, then nothing more
+sub stalled_client {
+    my ($what, $port, $request) = @_;
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_to($port);
+    my $start = time;
+
+    syswrite($socket, $request) or die "$what: write failed: $!\n"
+        if length $request;
+
+    expect_closed_in_time($what, wait_for_close($socket, $start, LATEST_CLOSE));
+
+    exit 0;
+}
+
+# Never finish the request, but keep sending a byte twice a second
+sub trickling_client {
+    my $port = shift;
+    my $what = 'trickling client';
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_to($port);
+    my $start = time;
+    my $select = IO::Select->new($socket);
+
+    # Keep extending a header before Host, so the request is never parsed
+    syswrite($socket, "GET / HTTP/1.1\r\nX-Slow: ")
+        or die "$what: write failed: $!\n";
+
+    while (time - $start < LATEST_CLOSE) {
+        if ($select->can_read(0.5)) {
+            my $bytes = sysread($socket, my $buffer, 4096);
+            die "$what: unexpected response: $buffer\n" if $bytes;
+
+            expect_closed_in_time($what, time - $start, '');
+            exit 0;
+        }
+
+        unless (defined syswrite($socket, 'x')) {
+            # EPIPE or ECONNRESET: the proxy has closed the connection
+            expect_closed_in_time($what, time - $start, '');
+            exit 0;
+        }
+    }
+
+    die "$what: not disconnected within ${\ LATEST_CLOSE} seconds\n";
+}
+
+# Take well over a second to send the request, but less than the timeout
+sub slow_client {
+    my $port = shift;
+    my $what = 'slow client';
+    # Host last: the request can't be parsed until it arrives
+    my @request = ("GET / HTTP/1.1\r\n",
+                   "User-Agent: request_timeout_test\r\n",
+                   "Accept: */*\r\n",
+                   "Host: localhost\r\n",
+                   "\r\n");
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $socket = connect_to($port);
+    my $start = time;
+
+    for (my $i = 0; $i < @request; $i++) {
+        sleep(0.5) if $i > 0;
+        syswrite($socket, $request[$i])
+            or die "$what: disconnected after sending part of request: $!\n";
+    }
+
+    my ($elapsed, $response) = wait_for_close($socket, $start, 10);
+    die "$what: unexpected response: $response\n"
+        unless $response =~ /\AHTTP\/1\.1 200 OK/;
+
+    exit 0;
+}
+
+# Wait for the proxy to close $socket within $limit seconds, starting now
+sub expect_closed_within {
+    my ($what, $socket, $limit) = @_;
+
+    my ($elapsed, $data) = wait_for_close($socket, time, $limit);
+    die "$what: not disconnected within $limit seconds\n"
+        unless defined $elapsed;
+    die "$what: unexpected response: $data\n" if length $data;
+}
+
+sub expect_open {
+    my ($what, $socket) = @_;
+
+    # A socket which was closed earlier is readable at once, so a short wait
+    # suffices; with no wait at all nothing would be checked
+    my ($elapsed, $data) = wait_for_close($socket, time, 1);
+    die "$what: unexpectedly closed\n" if defined $elapsed;
+    die "$what: unexpected response: $data\n" if length $data;
+}
+
+sub main {
+    my $http_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $tls_port = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $disabled_port = $ENV{SNI_PROXY_PORT3} || 8082;
+    my $httpd_port = $ENV{TEST_HTTPD_PORT} || 8083;
+
+    # Readable by the unprivileged user sniproxy runs as after dropping
+    # privileges, even when root's TMPDIR is private
+    my ($fh, $config) = File::Temp::tempfile(DIR => world_readable_tempdir());
+    close($fh);
+    # sniproxy drops privileges when run as root and must still be able to
+    # read the configuration when reloading
+    chmod(0644, $config);
+    write_config($config, $http_port, $tls_port, $disabled_port, $httpd_port, 0);
+
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    start_child('server', \&TestHTTPD::httpd, port => $httpd_port);
+
+    wait_for_port(port => $httpd_port);
+    wait_for_port(port => $http_port);
+    wait_for_port(port => $tls_port);
+    wait_for_port(port => $disabled_port);
+
+    # Opened first so it has been waiting the longest when the timeout is
+    # enabled below
+    my $idle_socket = connect_to($disabled_port);
+
+    start_child('worker', \&stalled_client, 'silent HTTP client', $http_port, '');
+    start_child('worker', \&stalled_client, 'silent TLS client', $tls_port, '');
+    # The Host header is parsed as soon as it is seen, so stall before it
+    start_child('worker', \&stalled_client, 'partial HTTP request', $http_port,
+                "GET / HTTP/1.1\r\nUser-Agent: request_timeout_test\r\nAcc");
+    # TLS record header of a ClientHello, but none of the record
+    start_child('worker', \&stalled_client, 'partial TLS request', $tls_port,
+                pack('C*', 0x16, 0x03, 0x01, 0x00, 0xc8));
+    start_child('worker', \&trickling_client, $http_port);
+    start_child('worker', \&slow_client, $http_port);
+    wait_for_type('worker');
+
+    # Checks made here rather than in a worker must not die before the
+    # servers are stopped
+    my $failed = !eval {
+        # Well past the timeout of the other listeners, but the timeout is
+        # disabled on this one
+        expect_open('client of listener with request_timeout 0', $idle_socket);
+
+        # Enabling the timeout on reload applies to the connection already
+        # open, which has been waiting longer than the new timeout
+        write_config($config, $http_port, $tls_port, $disabled_port,
+                     $httpd_port, TIMEOUT);
+        kill 1, $proxy_pid;
+        expect_closed_within('open client after enabling request_timeout on reload',
+                             $idle_socket, LATEST_CLOSE);
+
+        # With no connections left the timeout sweep stops, and the next
+        # connection must start it again
+        close($idle_socket);
+        sleep 2;
+        my $late_socket = connect_to($http_port);
+        expect_closed_within('silent client connecting once no other ' .
+                             'connections remained', $late_socket, LATEST_CLOSE);
+        1;
+    };
+    print "Test failed: $@" if $failed;
+
+    kill 15, $proxy_pid;
+    sleep 1;
+
+    unlink($config);
+
+    reap_children();
+    exit($failed ? 1 : 0);
+}
+
+main();

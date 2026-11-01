@@ -89,6 +89,12 @@ hostnames as addresses in the configuration or using wildcard backends.  If not
 specified the IPv4 only queries will be preformed using the system default name
 servers.
 
+Each nameserver is a numeric IPv4 or IPv6 address, queried on port 53; a port
+can not be specified. Up to six name servers may be listed, they are tried in
+order. Each search line appends a domain to the search list, which is applied
+as described in resolv.conf(5). The search domains may take up to 1023 bytes in
+total, counting each one as its length plus 2.
+
 Four modes are supported:
 
 ipv4_only: query for any A records, use the first A record returned
@@ -120,6 +126,8 @@ listener 192.0.2.10:80 {
     fallback 192.0.2.100:80
     bad_requests log
     source 192.0.2.10
+    request_timeout 10
+    idle_timeout 300
 
     access_log {
         filename /var/log/sniproxy/http_access.log
@@ -162,8 +170,12 @@ request. If no table directive is specified the default, unnamed, table will be
 used.
 
 The fallback directive specifies a server to be used if the client request can
-not be parsed, a server can not be found in the table for the hostname
-specified or the hostname can not be resolved.. This should be an IP address
+not be parsed or does not include a hostname, or no table entry matches the
+hostname. A request without a hostname is still looked up in the table first,
+as an empty hostname, so a catch-all pattern such as .* takes it before the
+fallback does. Without a fallback these requests receive the protocol's abort
+message (an HTTP 503 response or a TLS alert). The fallback is not used when the
+address of a hostname backend can't be resolved. This should be an IP address
 and port or unix socket path.
 
 The bad_requests directive allows logging the contents of the client request if
@@ -174,6 +186,36 @@ connecting to the backend server. In most cases it is better to omit this
 option and allow the operating system to select the outgoing address
 automatically. Do not include a port number in this address, doing so will
 limit the proxy to one simultaneous to each server at time.
+
+The request_timeout directive sets the number of seconds a client has, from
+when its connection is accepted, to send enough of its request for the hostname
+to be read (the TLS ClientHello, or for HTTP the request up to its Host header)
+and for the server's address to be resolved. Connections which take longer,
+such as clients which send nothing or send their request slowly to hold
+connections open, are closed without a response. The rest of the request and
+the server's response are not covered, see idle_timeout. Resolving can take
+longer than the timeout when name servers are slow to answer: with several
+name servers the resolver may take over 30 seconds to give up, and the client
+is then disconnected without the 503 response or TLS alert it would otherwise
+receive. The default is 30 seconds, 0 disables the timeout.
+
+The idle_timeout directive closes connections on which no data has been
+received or sent, on either the client or server side, for the given number of
+seconds. It is disabled (0) by default, so long lived connections with long
+pauses between messages are not interrupted.
+
+The half_close_timeout directive closes connections on which one side has
+finished sending, by shutting down its sending side (a TCP half-close) or by
+closing its socket, when no data has been received or sent on either side for
+the given number of seconds. When one side finishes, sniproxy passes this on
+to the other side and keeps relaying data in the other direction until that
+side finishes too; this bounds how long it waits for a peer which never does,
+such as a client which keeps its connection open after the server has closed
+it. The default is 60 seconds, 0 waits indefinitely.
+
+Timeouts are checked once a second, so a connection may be closed up to a
+second after its timeout. Changes to any timeout take effect on reload,
+including for connections which are already open.
 
 The access log configuration may be overridden on each listener.
 

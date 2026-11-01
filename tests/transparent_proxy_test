@@ -98,6 +98,19 @@ sub main {
         exit 77;
     }
 
+    foreach my $tool (qw(ip iptables tcpdump curl)) {
+        unless (grep { -x "$_/$tool" } split(/:/, $ENV{PATH} || '')) {
+            print STDERR "This test requires $tool\n";
+            exit 77;
+        }
+    }
+
+    # A failed run exits from reap_children() before the cleanup below,
+    # remove its network namespaces (and with them the veth pairs) so this
+    # run can create them again
+    system('ip netns delete ns-test-clt 2>/dev/null');
+    system('ip netns delete ns-test-proxy 2>/dev/null');
+
     # Setup a test network using network namespaces with the ns-test-proxy
     # namespace configured like a normal transparent proxy box.
     #

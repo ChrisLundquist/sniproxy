@@ -45,7 +45,7 @@ Usage
 
     Usage: sniproxy [-c <config>] [-f] [-n <max file descriptor limit>] [-V]
         -c  configuration file, defaults to /etc/sniproxy.conf
-        -f  run in foreground, do not drop privileges
+        -f  run in foreground, do not daemonize
         -n  specify file descriptor limit
         -V  print the version of SNIProxy and exit
 
@@ -102,7 +102,7 @@ This is the preferred installation method for modern Fedora based distributions.
         sudo yum install ../sniproxy-<version>.<arch>.rpm
 
 I've used Scientific Linux 6 a fair amount, but I prefer Debian based
-distributions. RPM builds are tested in Travis-CI on Ubuntu, but not natively.
+distributions. RPM builds are tested in GitHub Actions on Ubuntu, but not natively.
 This build process may not follow the current Fedora packaging standards, and
 may not even work.
 
@@ -142,6 +142,12 @@ Configuration Syntax
         # Specify a server to use if the initial client request doesn't contain
         # a hostname
         fallback 192.0.2.5:443
+
+        # Close connections whose hostname has not been received, and its
+        # address resolved, within 10 seconds (default 30), and connections
+        # idle for 5 minutes (default: never)
+        request_timeout 10
+        idle_timeout 300
     }
 
     table TableName {

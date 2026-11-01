@@ -34,7 +34,6 @@
 #include "logger.h"
 
 
-static void free_backend(struct Backend *);
 static const char *backend_config_options(const struct Backend *);
 
 
@@ -68,7 +67,7 @@ accept_backend_arg(struct Backend *backend, const char *arg) {
         }
 #ifndef HAVE_LIBUDNS
         if (!address_is_sockaddr(backend->address)) {
-            err("Only socket address backends are permitted when compiled without libudns");
+            err("Hostname and wildcard (*) backends require DNS support, which this build of sniproxy lacks (configure with --enable-dns and libudns): %s", arg);
             return -1;
         }
 #endif
@@ -182,7 +181,7 @@ remove_backend(struct Backend_head *head, struct Backend *backend) {
     free_backend(backend);
 }
 
-static void
+void
 free_backend(struct Backend *backend) {
     if (backend == NULL)
         return;

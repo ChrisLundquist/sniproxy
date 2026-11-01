@@ -60,9 +60,10 @@ next_token(FILE *config, char *buffer, size_t buffer_len) {
             case '}':
                 return TOKEN_CBRACE;
             default:
-                /* Rewind one byte, so next_word() can fetch from
-                 * the beginning of the word */
-                fseek(config, -1, SEEK_CUR);
+                /* Push back the first byte, so next_word() can fetch from
+                 * the beginning of the word. ungetc() rather than fseek()
+                 * so the configuration may be read from a pipe. */
+                ungetc(ch, config);
 
                 token_len = next_word(config, buffer, buffer_len);
                 if (token_len <= 0)
@@ -114,9 +115,9 @@ next_word(FILE *file, char *buffer, int buffer_len) {
             case '{':
             case '}':
                 if (quoted == 0) {
-                    /* rewind the file one character, so we don't eat
+                    /* push back the separator, so we don't eat
                      * part of the next token */
-                    fseek(file, -1, SEEK_CUR);
+                    ungetc(ch, file);
 
                     buffer[len] = '\0';
                     len++;
@@ -128,7 +129,15 @@ next_word(FILE *file, char *buffer, int buffer_len) {
                 len++;
         }
     }
-    /* We reached the end of the file, or filled our buffer */
+    /* A word may be terminated by the end of the file, as long as it is not
+     * inside an open quote or escape and fits in our buffer */
+    if (ch == EOF && !quoted && !escaped && len > 0 && len < buffer_len) {
+        buffer[len] = '\0';
+        len++;
+        return len;
+    }
+
+    /* We reached the end of the file inside a quote, or filled our buffer */
     return -1;
 }
 

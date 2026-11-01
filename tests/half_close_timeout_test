@@ -1,0 +1,240 @@
+#!/usr/bin/env perl
+
+# half_close_timeout bounds how long sniproxy waits for the second side of a
+# connection to finish once the first has:
+#  - the server responds and closes, the client keeps its connection open:
+#    sniproxy closes the connection after the timeout (seen in the access log);
+#  - the client half-closes after its request and the server never answers:
+#    the client sees the connection closed after the timeout;
+#  - with half_close_timeout 0 that connection stays open;
+#  - a half-closed connection which is still transferring data is not idle, so
+#    it is not closed even though it lasts longer than the timeout.
+
+use strict;
+use warnings;
+use File::Basename;
+use lib dirname (__FILE__);
+use TestUtils;
+use File::Temp;
+use IO::Socket::INET;
+use IO::Select;
+use Socket;
+use Time::HiRes qw(time sleep);
+
+my $timeout = 2;
+
+sub proxy {
+    my $config = shift;
+
+    exec(@_, '../src/sniproxy', '-f', '-c', $config);
+}
+
+sub read_request($) {
+    my $client = shift;
+    my $data = '';
+
+    until ($data =~ /\r\n\r\n/) {
+        my $bytes = sysread($client, my $chunk, 4096);
+        return undef unless $bytes;
+        $data .= $chunk;
+    }
+
+    return $data;
+}
+
+# Backend: 'respond' answers and closes, 'silent' reads the request and then
+# holds the connection without answering, 'trickle' sends its response slowly
+sub backend($$) {
+    my ($port, $mode) = @_;
+
+    my $server = IO::Socket::INET->new(Listen => SOMAXCONN,
+                                       Proto => 'tcp',
+                                       LocalAddr => '127.0.0.1',
+                                       LocalPort => $port,
+                                       ReuseAddr => 1)
+        or die "listen: $!\n";
+
+    $SIG{CHLD} = 'IGNORE';
+
+    while (my $client = $server->accept()) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid) {
+            close($client);
+            next;
+        }
+        # Don't keep the port bound after the backend itself has gone
+        close($server);
+
+        # Probe connections from wait_for_port() send nothing
+        exit 0 unless defined read_request($client);
+
+        if ($mode eq 'respond') {
+            syswrite($client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        } elsif ($mode eq 'trickle') {
+            for (my $i = 0; $i < 6; $i++) {
+                syswrite($client, "chunk $i\n");
+                sleep(0.5);
+            }
+        } else {
+            # Never answer, nor close in response to the end of stream
+            # sniproxy relays from the client: just hold the connection
+            sleep($timeout + 6);
+        }
+        close($client);
+        exit 0;
+    }
+}
+
+sub connect_proxy($$) {
+    my ($port, $hostname) = @_;
+
+    my $socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',
+                                       PeerPort => $port,
+                                       Proto => 'tcp')
+        or die "connect: $!\n";
+    syswrite($socket, "GET / HTTP/1.1\r\nHost: $hostname\r\n\r\n")
+        or die "write: $!\n";
+
+    return $socket;
+}
+
+# Read until end of stream or the deadline, returns the data and whether the
+# end of stream was seen
+sub read_until($$) {
+    my ($socket, $deadline) = @_;
+    my $select = IO::Select->new($socket);
+    my $data = '';
+
+    while ((my $left = $deadline - time()) > 0) {
+        next unless $select->can_read($left);
+        my $bytes = sysread($socket, my $chunk, 4096);
+        return ($data, 1) unless $bytes;
+        $data .= $chunk;
+    }
+
+    return ($data, 0);
+}
+
+# Server responds and closes, the client keeps its side open
+sub server_closes_worker($$) {
+    my ($port, $logfile) = @_;
+
+    my $socket = connect_proxy($port, 'respond.test');
+    my ($response, $eof) = read_until($socket, time() + 5);
+    die "No response with end of stream: $response\n"
+        unless $eof && $response =~ /\AHTTP\/1\.1 200 /;
+
+    # The client never closes: sniproxy logs the connection once it gives up
+    my $start = time();
+    while (time() - $start < $timeout + 4) {
+        open(my $log, '<', $logfile) or die "open $logfile: $!\n";
+        my $logged = grep { /\[respond\.test\]/ } <$log>;
+        close($log);
+        if ($logged) {
+            die "Connection closed after " . (time() - $start) . "s, " .
+                "before the half_close_timeout\n"
+                if time() - $start < $timeout - 1;
+            exit 0;
+        }
+        sleep(0.2);
+    }
+    die "Connection still open " . (time() - $start) . "s after the server closed\n";
+}
+
+# Client half-closes, the server never answers
+sub silent_server_worker($$) {
+    my ($port, $expect_close) = @_;
+
+    my $socket = connect_proxy($port, 'silent.test');
+    shutdown($socket, 1) or die "shutdown: $!\n";
+
+    my $start = time();
+    my ($data, $eof) = read_until($socket, $start + $timeout + 3);
+    if ($expect_close) {
+        die "Connection to a silent server not closed after the timeout\n"
+            unless $eof;
+        die "Connection closed after " . (time() - $start) . "s, before the " .
+            "half_close_timeout\n" if time() - $start < $timeout - 1;
+    } else {
+        die "Connection closed although half_close_timeout is 0\n" if $eof;
+    }
+
+    exit 0;
+}
+
+# Client half-closes, the server keeps sending for longer than the timeout
+sub trickle_worker($) {
+    my $port = shift;
+
+    my $socket = connect_proxy($port, 'trickle.test');
+    shutdown($socket, 1) or die "shutdown: $!\n";
+
+    my ($data, $eof) = read_until($socket, time() + 10);
+    my $expected = join('', map { "chunk $_\n" } 0 .. 5);
+    die "Transfer cut short: " . length($data) . " of " . length($expected) .
+        " bytes\n" unless $eof && $data eq $expected;
+
+    exit 0;
+}
+
+sub main {
+    my $proxy_port = $ENV{SNI_PROXY_PORT} || 8080;
+    my $proxy_port2 = $ENV{SNI_PROXY_PORT2} || 8081;
+    my $respond_port = $ENV{TEST_HTTPD_PORT} || 8082;
+    my $silent_port = $ENV{TEST_HTTPD_PORT2} || 8083;
+    my $trickle_port = $ENV{TEST_BACKEND_PORT} || 8084;
+
+    my ($fh, $config) = File::Temp::tempfile();
+    my ($unused, $logfile) = File::Temp::tempfile();
+    chmod(0644, $config);
+    chmod(0666, $logfile);
+    print $fh <<END;
+listen 127.0.0.1:$proxy_port {
+    proto http
+    table backends
+    half_close_timeout $timeout
+    access_log $logfile
+}
+
+listen 127.0.0.1:$proxy_port2 {
+    proto http
+    table backends
+    half_close_timeout 0
+}
+
+table backends {
+    ^respond\\.test\$ 127.0.0.1:$respond_port
+    ^silent\\.test\$ 127.0.0.1:$silent_port
+    ^trickle\\.test\$ 127.0.0.1:$trickle_port
+}
+END
+    close($fh);
+
+    my $proxy_pid = start_child('server', \&proxy, $config, @ARGV);
+    start_child('server', \&backend, $respond_port, 'respond');
+    start_child('server', \&backend, $silent_port, 'silent');
+    start_child('server', \&backend, $trickle_port, 'trickle');
+
+    wait_for_port(port => $proxy_port);
+    wait_for_port(port => $proxy_port2);
+    wait_for_port(port => $respond_port);
+    wait_for_port(port => $silent_port);
+    wait_for_port(port => $trickle_port);
+
+    start_child('worker', \&server_closes_worker, $proxy_port, $logfile);
+    start_child('worker', \&silent_server_worker, $proxy_port, 1);
+    start_child('worker', \&silent_server_worker, $proxy_port2, 0);
+    start_child('worker', \&trickle_worker, $proxy_port);
+    wait_for_type('worker');
+
+    kill 15, $proxy_pid;
+    sleep 1;
+
+    unlink($config);
+    unlink($logfile);
+
+    reap_children();
+}
+
+main();

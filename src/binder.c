@@ -172,12 +172,14 @@ binder_main(int sockfd) {
         if (result < 0) {
             memset(buffer, 0, sizeof(buffer));
             snprintf(buffer, sizeof(buffer), "setsockopt SO_REUSEADDR failed: %s", strerror(errno));
+            close(fd);
             goto error;
         }
 
         if (bind(fd, req->address, req->address_len) < 0) {
             memset(buffer, 0, sizeof(buffer));
             snprintf(buffer, sizeof(buffer), "bind(): %s", strerror(errno));
+            close(fd);
             goto error;
         }
 
@@ -206,6 +208,7 @@ binder_main(int sockfd) {
         if (sendmsg(sockfd, &msg, 0) < 0) {
             memset(buffer, 0, sizeof(buffer));
             snprintf(buffer, sizeof(buffer), "send: %s", strerror(errno));
+            close(fd);
             goto error;
         }
 

@@ -5,14 +5,27 @@ use strict;
 use POSIX ":sys_wait_h";
 use IO::Socket::INET;
 require File::Temp;
+require File::Spec;
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT = qw(start_child reap_children wait_for_type wait_for_port make_config);
+our @EXPORT = qw(start_child reap_children wait_for_type wait_for_port make_config world_readable_tempdir);
 our $VERSION = '0.01';
 
 $SIG{CHLD} = \&REAPER;
 
 my %children;
+my $parent_pid = $$;
+
+# If the test exits without reaping its children, e.g. because its main
+# process died on an unexpected error, stop them rather than leave servers
+# bound to the test ports behind for the next test. Children run this too
+# when they exit, but only the test's main process owns %children.
+END {
+    if ($$ == $parent_pid) {
+        my @running = grep { $children{$_}->{'running'} } keys %children;
+        kill 15, @running if @running;
+    }
+}
 
 sub REAPER {
     my $stiff;
@@ -32,11 +45,20 @@ sub start_child {
     my $child = shift;
     my @args = @_;
 
+    # Block SIGCHLD until the child is recorded in %children, otherwise a
+    # child that exits immediately can be reaped by REAPER first and then
+    # be marked as running forever, hanging wait_for_type().
+    my $sigchld = POSIX::SigSet->new(POSIX::SIGCHLD());
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), $sigchld)
+        or die("sigprocmask: $!");
+
     my $pid = fork();
     if (not defined $pid) {
         die("fork: $!");
     } elsif ($pid == 0) {
         undef $SIG{CHLD};
+        POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigchld)
+            or die("sigprocmask: $!");
         $child->(@args);
         # Should not be reached
         exit(99);
@@ -51,6 +73,9 @@ sub start_child {
         exit_core => undef,
     };
 
+    POSIX::sigprocmask(POSIX::SIG_UNBLOCK(), $sigchld)
+        or die("sigprocmask: $!");
+
     return $pid;
 }
 
@@ -60,12 +85,21 @@ sub reap_children {
         sleep 1;
     }
 
-    # Check that all our children exited cleanly
-    my @failures = grep($_->{'exit_code'} != 0 || $_->{'core_dumped'}, values %children);
+    # Check that all our children exited cleanly. Dying from a signal which
+    # indicates a crash is a failure even if no core file was written. Other
+    # signals are expected: we stop servers with SIGTERM, and some tests'
+    # clients kill themselves to simulate a connection reset.
+    my %crash_signals = map { $_ => 1 }
+        (POSIX::SIGSEGV, POSIX::SIGBUS, POSIX::SIGILL, POSIX::SIGFPE,
+         POSIX::SIGABRT);
+    my @failures = grep($_->{'exit_code'} != 0 ||
+                        $_->{'core_dumped'} ||
+                        $crash_signals{$_->{'signal'}},
+                        values %children);
     if (@failures) {
         print "Test failed.\n";
         foreach (@failures) {
-            if ($_->{'core_dumped'}) {
+            if ($_->{'signal'}) {
                 printf "%s died with signal %d, %s coredump\n", $_->{'type'}, $_->{'signal'}, $_->{'core_dumped'} ? 'with' : 'without';
             } else {
                 print "$_->{'type'} failed with exit code $_->{'exit_code'}\n";
@@ -139,6 +173,35 @@ END
     close ($fh);
 
     return $filename;
+}
+
+# Can other users reach the directory, i.e. search it and all its parents
+sub world_searchable($) {
+    my @dirs = File::Spec->splitdir(File::Spec->rel2abs(shift));
+
+    while (@dirs) {
+        my @st = stat(File::Spec->catdir(@dirs))
+            or return 0;
+        return 0 unless $st[2] & 0001;
+        pop @dirs;
+    }
+
+    return 1;
+}
+
+# Started as root, sniproxy drops privileges (to the daemon user by default)
+# and still has to read its configuration and reopen its log files on reload.
+# Return a new directory for such files that the unprivileged user can reach:
+# in TMPDIR unless other users can't get to it, otherwise in /tmp.
+sub world_readable_tempdir() {
+    my $parent = File::Spec->tmpdir;
+    $parent = '/tmp' if $< == 0 && !world_searchable($parent);
+
+    my $dir = File::Temp::tempdir('sniproxy-test-XXXXXX',
+                                  DIR => $parent, CLEANUP => 1);
+    chmod(0755, $dir) or die("chmod(): $!");
+
+    return $dir;
 }
 
 1;

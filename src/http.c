@@ -88,9 +88,16 @@ parse_http_header(const char* data, size_t data_len, char **hostname) {
             (*hostname)[i] = '\0';
             result = i;
             break;
-        } else if (!isdigit((*hostname)[i])) {
+        } else if (!isdigit((unsigned char)(*hostname)[i])) {
             break;
         }
+
+    /* Only a port, e.g. "Host: :80", doesn't name a host either */
+    if (result == 0) {
+        free(*hostname);
+        *hostname = NULL;
+        return -2;
+    }
 
     return result;
 }
@@ -103,10 +110,21 @@ get_header(const char *header, const char *data, size_t data_len, char **value) 
 
     /* loop through headers stopping at first blank line */
     while ((len = next_header(&data, &data_len)) != 0)
-        if (len > header_len && strncasecmp(header, data, header_len) == 0) {
+        /* >= so a header with nothing after the colon is found too, and
+         * rejected as empty below rather than skipped for a later one */
+        if (len >= header_len && strncasecmp(header, data, header_len) == 0) {
             /* Eat leading whitespace */
-            while (header_len < len && isblank(data[header_len]))
+            while (header_len < len && isblank((unsigned char)data[header_len]))
                 header_len++;
+
+            /* and trailing whitespace, which isn't part of the field value
+             * either (RFC 7230 section 3.2) */
+            while (len > header_len && isblank((unsigned char)data[len - 1]))
+                len--;
+
+            /* An empty Host header doesn't name a host */
+            if (len == header_len)
+                return -2;
 
             *value = malloc(len - header_len + 1);
             if (*value == NULL)
@@ -149,6 +167,16 @@ next_header(const char **data, size_t *len) {
     header_len = 0;
     while (*len > header_len && (*data)[header_len] != '\n')
         header_len++;
+
+    /* A header without its terminating <LF> hasn't been fully received yet:
+     * the rest of a Host header, for example, may still be in flight.
+     * Consume it so the caller sees an incomplete request. */
+    if (header_len == *len) {
+        *data += *len;
+        *len = 0;
+        return 0;
+    }
+
     /* ignore preceding <CR> */
     if (header_len > 0 && (*data)[header_len - 1] == '\r')
         header_len--;
