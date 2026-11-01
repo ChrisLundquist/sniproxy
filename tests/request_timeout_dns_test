@@ -25,9 +25,12 @@ sub proxy {
     my $config = shift;
     my $dns_port = shift;
 
-    # Make udns ask our name server, once, and wait DNS_TIMEOUT for it
+    # Make udns ask our name server, once, and wait DNS_TIMEOUT for it. Ask
+    # for the name as given first, without the host's search domains (such
+    # as a Kubernetes pod's, with ndots:5), which would delay that query.
     $ENV{'NAMESERVERS'} = '127.0.0.1';
-    $ENV{'RES_OPTIONS'} = "port:$dns_port timeout:${\ DNS_TIMEOUT} attempts:1";
+    $ENV{'RES_OPTIONS'} = "port:$dns_port timeout:${\ DNS_TIMEOUT} attempts:1 ndots:1";
+    $ENV{'LOCALDOMAIN'} = '';
     exec(@_, '../src/sniproxy', '-f', '-c', $config);
 }
 
@@ -168,12 +171,12 @@ sub main {
 
     my $failed = !eval {
         open(my $fh, '<', $dns_log) or die "open: $!\n";
-        my %queried = map { chomp; ($_ => 1) } <$fh>;
+        my @queried = map { chomp; $_ } <$fh>;
         close($fh);
 
         # Otherwise the timeout did not happen while resolving
         die "no DNS query received for timeout.example\n"
-            unless $queried{'timeout.example'};
+            unless grep { /\Atimeout\.example(\.|\z)/ } @queried;
         1;
     };
     print "Test failed: $@" if $failed;
