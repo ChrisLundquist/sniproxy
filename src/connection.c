@@ -76,10 +76,12 @@ static inline int client_socket_open(const struct Connection *);
 static inline int server_socket_open(const struct Connection *);
 
 static void reactivate_watcher(struct ev_loop *, struct ev_io *,
-        const struct Buffer *, const struct Buffer *);
+        const struct Buffer *, int, const struct Buffer *);
 
 static void connection_cb(struct ev_loop *, struct ev_io *, int);
 static void resolv_cb(struct Address *, void *);
+static void update_connection(struct Connection *, struct ev_loop *);
+static void relay_shutdowns(struct Connection *, struct ev_loop *);
 static void reactivate_watchers(struct Connection *, struct ev_loop *);
 static void insert_proxy_v1_header(struct Connection *);
 static void parse_client_request(struct Connection *);
@@ -215,6 +217,7 @@ print_connections(void) {
  * Test is client socket is open
  *
  * Returns true iff the client socket is opened based on connection state.
+ * An open socket may be half-closed, see client.eof and client.shut_wr.
  */
 static inline int
 client_socket_open(const struct Connection *con) {
@@ -230,6 +233,7 @@ client_socket_open(const struct Connection *con) {
  * Test is server socket is open
  *
  * Returns true iff the server socket is opened based on connection state.
+ * An open socket may be half-closed, see server.eof and server.shut_wr.
  */
 static inline int
 server_socket_open(const struct Connection *con) {
@@ -256,11 +260,12 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
         is_client ? con->client.buffer : con->server.buffer;
     struct Buffer *output_buffer =
         is_client ? con->server.buffer : con->client.buffer;
+    int *input_eof = is_client ? &con->client.eof : &con->server.eof;
     void (*close_socket)(struct Connection *, struct ev_loop *) =
         is_client ? close_client_socket : close_server_socket;
 
     /* Receive first in case the socket was closed */
-    if (revents & EV_READ && buffer_room(input_buffer)) {
+    if (revents & EV_READ && !*input_eof && buffer_room(input_buffer)) {
         ssize_t bytes_received = buffer_recv(input_buffer, w->fd, 0, loop);
         if (bytes_received < 0 && !IS_TEMPORARY_SOCKERR(errno)) {
             warn("recv(%s): %s, closing connection",
@@ -269,9 +274,10 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
 
             close_socket(con, loop);
             revents = 0; /* Clear revents so we don't try to send */
-        } else if (bytes_received == 0) { /* peer closed socket */
-            close_socket(con, loop);
-            revents = 0;
+        } else if (bytes_received == 0) {
+            /* Peer shut down its sending side, but it may still be
+             * reading: keep relaying data to it, see relay_shutdowns() */
+            *input_eof = 1;
         }
     }
 
@@ -289,12 +295,31 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
 
     /* Handle any state specific logic, note we may transition through several
      * states during a single call */
-    if (is_client && con->state == ACCEPTED)
-        parse_client_request(con);
+    if (is_client && con->state == ACCEPTED) {
+        /* Anything beyond a PROXY header we prepended came from the client */
+        if (con->client.eof &&
+                buffer_len(con->client.buffer) <= con->header_len)
+            close_client_socket(con, loop); /* closed without a request */
+        else
+            parse_client_request(con);
+    }
     if (is_client && con->state == PARSED)
         resolve_server_address(con, loop);
     if (is_client && con->state == RESOLVED)
         initiate_server_connect(con, loop);
+
+    update_connection(con, loop);
+}
+
+/*
+ * Common tail of the socket and DNS callbacks: relay half-closes, close the
+ * remaining socket once the data destined for it has been flushed, then
+ * either free the connection or rearm its watchers.
+ */
+static void
+update_connection(struct Connection *con, struct ev_loop *loop) {
+    if (con->state == CONNECTED)
+        relay_shutdowns(con, loop);
 
     /* Close other socket if we have flushed corresponding buffer */
     if (con->state == SERVER_CLOSED && buffer_len(con->server.buffer) == 0)
@@ -315,6 +340,42 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
     reactivate_watchers(con, loop);
 }
 
+/*
+ * Relay half-closes: once a peer has shut down its sending side and all the
+ * data it sent has been flushed to the other peer, shut down our sending side
+ * toward that other peer so it sees the end of stream too. Data keeps flowing
+ * in the opposite direction until that peer shuts down as well, at which point
+ * both sockets are closed.
+ */
+static void
+relay_shutdowns(struct Connection *con, struct ev_loop *loop) {
+    assert(con->state == CONNECTED);
+
+    if (con->client.eof && !con->server.shut_wr &&
+            buffer_len(con->client.buffer) == 0) {
+        if (shutdown(con->server.watcher.fd, SHUT_WR) < 0) {
+            warn("shutdown(server): %s, closing connection", strerror(errno));
+            close_server_socket(con, loop);
+            return;
+        }
+        con->server.shut_wr = 1;
+    }
+
+    if (con->server.eof && !con->client.shut_wr &&
+            buffer_len(con->server.buffer) == 0) {
+        if (shutdown(con->client.watcher.fd, SHUT_WR) < 0) {
+            warn("shutdown(client): %s, closing connection", strerror(errno));
+            close_client_socket(con, loop);
+            return;
+        }
+        con->client.shut_wr = 1;
+    }
+
+    /* Both directions have finished */
+    if (con->client.shut_wr && con->server.shut_wr)
+        close_connection(con, loop);
+}
+
 static void
 reactivate_watchers(struct Connection *con, struct ev_loop *loop) {
     struct ev_io *client_watcher = &con->client.watcher;
@@ -323,15 +384,25 @@ reactivate_watchers(struct Connection *con, struct ev_loop *loop) {
     /* Reactivate watchers */
     if (client_socket_open(con))
         reactivate_watcher(loop, client_watcher,
-                con->client.buffer, con->server.buffer);
+                con->client.buffer, con->client.eof, con->server.buffer);
 
     if (server_socket_open(con))
         reactivate_watcher(loop, server_watcher,
-                con->server.buffer, con->client.buffer);
+                con->server.buffer, con->server.eof, con->client.buffer);
 
     /* Neither watcher is active when the corresponding socket is closed */
     assert(client_socket_open(con) || !ev_is_active(client_watcher));
     assert(server_socket_open(con) || !ev_is_active(server_watcher));
+
+    /* No watcher reads from a peer which has shut down its sending side */
+    assert(!con->client.eof || !ev_is_active(client_watcher) ||
+           !(client_watcher->events & EV_READ));
+    assert(!con->server.eof || !ev_is_active(server_watcher) ||
+           !(server_watcher->events & EV_READ));
+
+    /* No data is queued toward a peer after we shut down sending to it */
+    assert(!con->client.shut_wr || buffer_len(con->server.buffer) == 0);
+    assert(!con->server.shut_wr || buffer_len(con->client.buffer) == 0);
 
     /* At least one watcher is still active for this connection,
      * or DNS callback active */
@@ -346,11 +417,11 @@ reactivate_watchers(struct Connection *con, struct ev_loop *loop) {
 
 static void
 reactivate_watcher(struct ev_loop *loop, struct ev_io *w,
-        const struct Buffer *input_buffer,
+        const struct Buffer *input_buffer, int input_eof,
         const struct Buffer *output_buffer) {
     int events = 0;
 
-    if (buffer_room(input_buffer))
+    if (!input_eof && buffer_room(input_buffer))
         events |= EV_READ;
 
     if (buffer_len(output_buffer))
@@ -500,7 +571,10 @@ parse_client_request(struct Connection *con) {
     if (result < 0) {
         char client[INET6_ADDRSTRLEN + 8];
 
-        if (result == -1) { /* incomplete request */
+        if (result == -1 && con->client.eof) { /* incomplete request */
+            warn("Request from %s incomplete when client shut down connection",
+                    display_sockaddr(&con->client.addr, client, sizeof(client)));
+        } else if (result == -1) { /* incomplete request */
             if (buffer_room(con->client.buffer) > 0)
                 return; /* give client a chance to send more data */
 
@@ -702,7 +776,9 @@ resolv_cb(struct Address *result, void *data) {
     }
 
     con->query_handle = NULL;
-    reactivate_watchers(con, loop);
+    /* The client may have shut down its sending side while we were
+     * resolving, and the connection may already be finished */
+    update_connection(con, loop);
 }
 
 static void

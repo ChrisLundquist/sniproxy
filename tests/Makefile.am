@@ -15,6 +15,7 @@ TESTS += functional_test \
          bad_request_test \
          bind_source_test \
          connection_reset_test \
+         half_close_test \
          fallback_test \
          fd_limit_test \
          ipv6_v6only_test \
