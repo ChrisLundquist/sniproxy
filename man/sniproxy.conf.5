@@ -188,11 +188,16 @@ automatically. Do not include a port number in this address, doing so will
 limit the proxy to one simultaneous to each server at time.
 
 The request_timeout directive sets the number of seconds a client has, from
-when its connection is accepted, to send a request which can be parsed and for
-the server's address to be resolved. Connections which take longer, such as
-clients which send nothing or send their request slowly to hold connections
-open, are closed without a response. The default is 30 seconds, 0 disables the
-timeout.
+when its connection is accepted, to send enough of its request for the hostname
+to be read (the TLS ClientHello, or for HTTP the request up to its Host header)
+and for the server's address to be resolved. Connections which take longer,
+such as clients which send nothing or send their request slowly to hold
+connections open, are closed without a response. The rest of the request and
+the server's response are not covered, see idle_timeout. Resolving can take
+longer than the timeout when name servers are slow to answer: with several
+name servers the resolver may take over 30 seconds to give up, and the client
+is then disconnected without the 503 response or TLS alert it would otherwise
+receive. The default is 30 seconds, 0 disables the timeout.
 
 The idle_timeout directive closes connections on which no data has been
 received or sent, on either the client or server side, for the given number of

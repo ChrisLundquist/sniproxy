@@ -143,9 +143,9 @@ Configuration Syntax
         # a hostname
         fallback 192.0.2.5:443
 
-        # Close connections which have not sent a complete request within 10
-        # seconds (default 30), and connections idle for 5 minutes (default:
-        # never)
+        # Close connections whose hostname has not been received, and its
+        # address resolved, within 10 seconds (default 30), and connections
+        # idle for 5 minutes (default: never)
         request_timeout 10
         idle_timeout 300
     }
