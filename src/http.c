@@ -28,6 +28,7 @@
 #include <string.h> /* strncpy() */
 #include <strings.h> /* strncasecmp() */
 #include <ctype.h> /* isblank(), isdigit() */
+#include <sys/types.h> /* ssize_t */
 #include "http.h"
 #include "protocol.h"
 
@@ -36,7 +37,7 @@
 
 static int parse_http_header(const char *, size_t, char **);
 static int get_header(const char *, const char *, size_t, char **);
-static size_t next_header(const char **, size_t *);
+static ssize_t next_header(const char **, size_t *);
 
 
 static const char http_503[] =
@@ -97,12 +98,14 @@ parse_http_header(const char* data, size_t data_len, char **hostname) {
 
 static int
 get_header(const char *header, const char *data, size_t data_len, char **value) {
+    ssize_t result;
     size_t len, header_len;
 
     header_len = strlen(header);
 
     /* loop through headers stopping at first blank line */
-    while ((len = next_header(&data, &data_len)) != 0)
+    while ((result = next_header(&data, &data_len)) > 0) {
+        len = (size_t)result;
         if (len > header_len && strncasecmp(header, data, header_len) == 0) {
             /* Eat leading whitespace */
             while (header_len < len && isblank(data[header_len]))
@@ -117,40 +120,51 @@ get_header(const char *header, const char *data, size_t data_len, char **value) 
 
             return len - header_len;
         }
+    }
 
-    /* If there is no data left after reading all the headers then we do not
-     * have a complete HTTP request, there must be a blank line */
-    if (data_len == 0)
+    /* We ran out of data before reaching the blank line that ends the
+     * headers, so we do not have a complete HTTP request yet */
+    if (result < 0)
         return -1;
 
     return -2;
 }
 
-static size_t
+/*
+ * Advances *data past the current line (the request line on the first call,
+ * the previously returned header after that) and finds the next line.
+ *
+ * Lines end with <LF>, optionally preceded by <CR>. A line that runs to the
+ * end of the buffer may have been cut short by a TCP segment boundary, so it
+ * is never returned as a header.
+ *
+ * Returns:
+ *  >0  - length of the next header line, excluding its line terminator
+ *   0  - the next line is the blank line ending the headers
+ *  -1  - the current or next line is not terminated; incomplete request
+ */
+static ssize_t
 next_header(const char **data, size_t *len) {
+    const char *eol;
     size_t header_len;
 
-    if (*len == 0)
-        return 0;
+    /* Skip past the <LF> ending the current line */
+    eol = memchr(*data, '\n', *len);
+    if (eol == NULL)
+        return -1;
 
-    /* perhaps we can optimize this to reuse the value of header_len, rather
-     * than scanning twice.
-     * Walk our data stream until the end of the header */
-    while (*len > 1 && (*data)[0] != '\n') {
-        (*len)--;
-        (*data)++;
-    }
+    *len -= (size_t)(eol - *data) + 1;
+    *data = eol + 1;
 
-    /* advanced past the <LF> */
-    (*data)++;
-    (*len)--;
+    /* Find the <LF> ending the next line */
+    eol = memchr(*data, '\n', *len);
+    if (eol == NULL)
+        return -1;
 
-    /* Find the length of the next header */
-    header_len = 0;
-    while (*len > header_len && (*data)[header_len] != '\n')
-        header_len++;
+    header_len = (size_t)(eol - *data);
     /* ignore preceding <CR> */
     if (header_len > 0 && (*data)[header_len - 1] == '\r')
         header_len--;
-    return header_len;
+
+    return (ssize_t)header_len;
 }
