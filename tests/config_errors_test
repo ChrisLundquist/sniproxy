@@ -108,6 +108,23 @@ my @cases = (
         config => "resolver {\n" . join('', map { "    nameserver 192.0.2.$_\n" } 1..7) . "}\n",
         valid => 0,
     },
+    {
+        name => 'half_close_timeout is parsed',
+        config => "listener 127.0.0.1:8443 {\n    half_close_timeout 5\n}\n" .
+                  "table {\n    ^a\$ 192.0.2.1:443\n}\n",
+        valid => 1,
+        output => qr/^\thalf_close_timeout 5$/m,
+    },
+    {
+        name => 'negative half_close_timeout',
+        config => "listener 127.0.0.1:8443 {\n    half_close_timeout -1\n}\n",
+        valid => 0,
+    },
+    {
+        name => 'half_close_timeout with a unit',
+        config => "listener 127.0.0.1:8443 {\n    half_close_timeout 60s\n}\n",
+        valid => 0,
+    },
 );
 
 my $failures = 0;

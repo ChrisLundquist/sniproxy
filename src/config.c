@@ -156,6 +156,10 @@ static const struct Keyword listener_stanza_grammar[] = {
         .parse_arg=(int(*)(void *, const char *))accept_listener_idle_timeout,
     },
     {
+        .keyword="half_close_timeout",
+        .parse_arg=(int(*)(void *, const char *))accept_listener_half_close_timeout,
+    },
+    {
         .keyword = NULL,
     },
 };

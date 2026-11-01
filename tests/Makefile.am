@@ -16,6 +16,7 @@ TESTS += functional_test \
          bind_source_test \
          connection_reset_test \
          half_close_test \
+         half_close_timeout_test \
          fallback_test \
          fd_limit_test \
          idle_timeout_test \

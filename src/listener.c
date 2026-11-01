@@ -54,6 +54,7 @@
  * the server's address) unless the listener configures otherwise
  */
 #define DEFAULT_REQUEST_TIMEOUT 30
+#define DEFAULT_HALF_CLOSE_TIMEOUT 60
 
 static void close_listener(struct ev_loop *, struct Listener *);
 static void accept_cb(struct ev_loop *, struct ev_io *, int);
@@ -213,6 +214,7 @@ listener_update(struct Listener *existing_listener, struct Listener *new_listene
      * apply to connections accepted before the reload */
     existing_listener->request_timeout = new_listener->request_timeout;
     existing_listener->idle_timeout = new_listener->idle_timeout;
+    existing_listener->half_close_timeout = new_listener->half_close_timeout;
 
     struct Table *new_table =
             table_lookup(tables, existing_listener->table_name);
@@ -267,6 +269,7 @@ new_listener(void) {
     listener->fallback_use_proxy_header = 0;
     listener->request_timeout = DEFAULT_REQUEST_TIMEOUT;
     listener->idle_timeout = 0;
+    listener->half_close_timeout = DEFAULT_HALF_CLOSE_TIMEOUT;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
      * are not active */
@@ -511,6 +514,17 @@ int
 accept_listener_idle_timeout(struct Listener *listener, const char *timeout) {
     if (!parse_timeout(timeout, &listener->idle_timeout)) {
         err("Invalid idle_timeout %s, expected a number of seconds "
+                "or 0 to disable", timeout);
+        return -1;
+    }
+
+    return 1;
+}
+
+int
+accept_listener_half_close_timeout(struct Listener *listener, const char *timeout) {
+    if (!parse_timeout(timeout, &listener->half_close_timeout)) {
+        err("Invalid half_close_timeout %s, expected a number of seconds "
                 "or 0 to disable", timeout);
         return -1;
     }
@@ -810,6 +824,7 @@ print_listener_config(FILE *file, const struct Listener *listener) {
 
     fprintf(file, "\trequest_timeout %d\n", listener->request_timeout);
     fprintf(file, "\tidle_timeout %d\n", listener->idle_timeout);
+    fprintf(file, "\thalf_close_timeout %d\n", listener->half_close_timeout);
 
     fprintf(file, "}\n\n");
 }

@@ -194,8 +194,17 @@ received or sent, on either the client or server side, for the given number of
 seconds. It is disabled (0) by default, so long lived connections with long
 pauses between messages are not interrupted.
 
+The half_close_timeout directive closes connections on which one side has
+finished sending, by shutting down its sending side (a TCP half-close) or by
+closing its socket, when no data has been received or sent on either side for
+the given number of seconds. When one side finishes, sniproxy passes this on
+to the other side and keeps relaying data in the other direction until that
+side finishes too; this bounds how long it waits for a peer which never does,
+such as a client which keeps its connection open after the server has closed
+it. The default is 60 seconds, 0 waits indefinitely.
+
 Timeouts are checked once a second, so a connection may be closed up to a
-second after its timeout. Changes to either timeout take effect on reload,
+second after its timeout. Changes to any timeout take effect on reload,
 including for connections which are already open.
 
 The access log configuration may be overridden on each listener.

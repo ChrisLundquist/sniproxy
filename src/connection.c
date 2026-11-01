@@ -83,6 +83,7 @@ static struct ev_timer timeout_watcher;
 static inline int client_socket_open(const struct Connection *);
 static inline int server_socket_open(const struct Connection *);
 static inline int server_connect_pending(const struct Connection *);
+static inline int connection_half_closed(const struct Connection *);
 
 static void reactivate_watcher(struct ev_loop *, struct ev_io *,
         const struct Buffer *, int, const struct Buffer *);
@@ -278,6 +279,23 @@ server_connect_pending(const struct Connection *con) {
 }
 
 /*
+ * Test if either side of the connection has finished
+ *
+ * Returns true iff one peer has shut down its sending side or closed its
+ * socket while we are still relaying to or from the other, the case the half
+ * close timeout applies to. Before the server connection is established
+ * connections are covered by the request timeout instead, except once an
+ * abort message is being flushed to the client.
+ */
+static inline int
+connection_half_closed(const struct Connection *con) {
+    return (con->state == CONNECTED &&
+            (con->client.eof || con->server.eof)) ||
+        con->state == SERVER_CLOSED ||
+        con->state == CLIENT_CLOSED;
+}
+
+/*
  * Main client callback: this is used by both the client and server watchers
  *
  * The logic is almost the same except for:
@@ -439,7 +457,7 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
 }
 
 /*
- * Close and free con if it has exceeded either of its listener's timeouts
+ * Close and free con if it has exceeded any of its listener's timeouts
  *
  * The request timeout limits how long after accepting the connection we may
  * still be waiting for the client's complete request or resolving the
@@ -448,6 +466,9 @@ timeout_cb(struct ev_loop *loop, struct ev_timer *w,
  *
  * The idle timeout limits how long no data may be received or sent on
  * either socket, in any state.
+ *
+ * The half close timeout limits how long a connection on which one peer has
+ * finished may stay idle waiting for the other peer to finish too.
  */
 static void
 check_connection_timeout(struct Connection *con, ev_tstamp now,
@@ -475,6 +496,19 @@ check_connection_timeout(struct Connection *con, ev_tstamp now,
         info("Connection from %s idle for %d seconds, closing connection",
                 display_sockaddr(&con->client.addr, client, sizeof(client)),
                 listener->idle_timeout);
+    } else if (listener->half_close_timeout > 0 &&
+            connection_half_closed(con) &&
+            now - connection_last_activity(con) >=
+                listener->half_close_timeout) {
+        /* One peer has finished, and the other has neither finished too nor
+         * sent or read anything since: e.g. a client which never closes after
+         * the server did, or a server which never answers a client which
+         * half-closed. We no longer read from a peer after its end of stream,
+         * so we would not otherwise notice if it went away. */
+        info("Half-closed connection from %s idle for %d seconds, "
+                "closing connection",
+                display_sockaddr(&con->client.addr, client, sizeof(client)),
+                listener->half_close_timeout);
     } else {
         return;
     }
