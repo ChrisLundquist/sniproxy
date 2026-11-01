@@ -42,14 +42,18 @@ sub start_child {
         exit(99);
     }
 
-    $children{$pid} = {
-        type => $type,
-        pid => $pid,
+    # A child which exits quickly may already have been reaped by REAPER,
+    # which ran between fork() returning and here and recorded its exit
+    # status: keep that rather than marking the child running again, which
+    # would leave wait_for_type() waiting for it forever.
+    $children{$pid} //= {
         running => 1,
-        core_dumped => undef,
+        exit_code => undef,
         signal => undef,
-        exit_core => undef,
+        core_dumped => undef,
     };
+    $children{$pid}->{'type'} = $type;
+    $children{$pid}->{'pid'} = $pid;
 
     return $pid;
 }
