@@ -74,6 +74,26 @@ int main(void) {
         assert(hostname == NULL);
     }
 
+    /* Requests may arrive in pieces: every prefix of a good request must
+     * either be incomplete or yield the complete hostname, never a hostname
+     * cut short (e.g. "loc" from "Host: loc") */
+    for (i = 0; i < sizeof(good) / sizeof(const char *); i++) {
+        for (size_t len = 0; len < strlen(good[i]); len++) {
+            hostname = NULL;
+
+            result = http_protocol->parse_packet(good[i], len, &hostname);
+
+            if (result == -1) {
+                assert(hostname == NULL);
+            } else {
+                assert(result == 9);
+                assert(hostname != NULL);
+                assert(0 == strcmp("localhost", hostname));
+                free(hostname);
+            }
+        }
+    }
+
     return 0;
 }
 

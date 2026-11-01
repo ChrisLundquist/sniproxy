@@ -149,6 +149,16 @@ next_header(const char **data, size_t *len) {
     header_len = 0;
     while (*len > header_len && (*data)[header_len] != '\n')
         header_len++;
+
+    /* A header without its terminating <LF> hasn't been fully received yet:
+     * the rest of a Host header, for example, may still be in flight.
+     * Consume it so the caller sees an incomplete request. */
+    if (header_len == *len) {
+        *data += *len;
+        *len = 0;
+        return 0;
+    }
+
     /* ignore preceding <CR> */
     if (header_len > 0 && (*data)[header_len - 1] == '\r')
         header_len--;
