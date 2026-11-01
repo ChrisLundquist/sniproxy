@@ -72,12 +72,21 @@ sub reap_children {
         sleep 1;
     }
 
-    # Check that all our children exited cleanly
-    my @failures = grep($_->{'exit_code'} != 0 || $_->{'core_dumped'}, values %children);
+    # Check that all our children exited cleanly. Dying from a signal which
+    # indicates a crash is a failure even if no core file was written. Other
+    # signals are expected: we stop servers with SIGTERM, and some tests'
+    # clients kill themselves to simulate a connection reset.
+    my %crash_signals = map { $_ => 1 }
+        (POSIX::SIGSEGV, POSIX::SIGBUS, POSIX::SIGILL, POSIX::SIGFPE,
+         POSIX::SIGABRT);
+    my @failures = grep($_->{'exit_code'} != 0 ||
+                        $_->{'core_dumped'} ||
+                        $crash_signals{$_->{'signal'}},
+                        values %children);
     if (@failures) {
         print "Test failed.\n";
         foreach (@failures) {
-            if ($_->{'core_dumped'}) {
+            if ($_->{'signal'}) {
                 printf "%s died with signal %d, %s coredump\n", $_->{'type'}, $_->{'signal'}, $_->{'core_dumped'} ? 'with' : 'without';
             } else {
                 print "$_->{'type'} failed with exit code $_->{'exit_code'}\n";
