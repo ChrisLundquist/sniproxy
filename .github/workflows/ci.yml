@@ -85,7 +85,8 @@ jobs:
         run: |
           status=0
           for t in bad_dns_request_test bad_request_test bind_source_test \
-                   connection_reset_test functional_test proxy_header_test \
+                   connection_reset_test functional_test half_close_test \
+                   large_request_test proxy_header_test reload_listener_test \
                    reload_test slow_client_test; do
             echo "::group::$t"
             rc=0
