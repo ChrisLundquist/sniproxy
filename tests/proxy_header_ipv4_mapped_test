@@ -13,7 +13,7 @@ use TestUtils;
 use TestHTTPD;
 use File::Temp;
 use IO::Socket::INET;
-use Socket qw(AF_INET6 SOCK_STREAM IPPROTO_IPV6 IPV6_V6ONLY pack_sockaddr_in6 inet_pton);
+use Socket qw(AF_INET6 SOCK_STREAM SOL_SOCKET SO_REUSEADDR IPPROTO_IPV6 IPV6_V6ONLY pack_sockaddr_in6 inet_pton);
 
 sub proxy {
     my $config = shift;
@@ -50,6 +50,9 @@ sub dual_stack_available($) {
     my $port = shift;
 
     socket(my $sock, AF_INET6, SOCK_STREAM, 0) or return 0;
+    # Earlier tests leave connections to this port in TIME_WAIT, which makes
+    # bind() fail without SO_REUSEADDR (sniproxy sets it too).
+    setsockopt($sock, SOL_SOCKET, SO_REUSEADDR, 1) or return 0;
     setsockopt($sock, IPPROTO_IPV6, IPV6_V6ONLY, 0) or return 0;
     my $result = bind($sock, pack_sockaddr_in6($port, inet_pton(AF_INET6, '::')));
     close($sock);
